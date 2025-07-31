@@ -31,6 +31,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    BaseBg,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +163,10 @@ impl Theme {
         .collect();
         Theme::new(name, parent.map(|p| p.name.clone()), styles)
     }
+
+    pub fn get_background_color(&self) -> Color {
+        self.styles[&Meaning::BaseBg].foreground_color.unwrap()
+    }
 }
 
 // Use palette to get a color from a string name, if possible
@@ -291,6 +296,10 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
             ),
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
             (Meaning::Base, ContentStyle::default()),
+            (
+                Meaning::BaseBg,
+                StyleFactory::from_fg_color(Color::DarkGrey),
+            ),
         ]),
     )
 });
@@ -327,7 +336,19 @@ static BUILTIN_THEMES: LazyLock<HashMap<&'static str, Theme>> = LazyLock::new(||
                     Meaning::Annotation,
                     StyleFactory::from_fg_color(Color::DarkGrey),
                 ),
-                (Meaning::Guidance, StyleFactory::known_fg_string("brown")),
+                (
+                    Meaning::Guidance,
+                    StyleFactory::from_fg_color(Color::DarkBlue),
+                ),
+                (
+                    Meaning::Important,
+                    StyleFactory::from_fg_color_and_attributes(
+                        Color::White,
+                        Attributes::from(Attribute::Bold),
+                    ),
+                ),
+                (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
+                (Meaning::Base, ContentStyle::default()),
             ]),
         ),
         (
