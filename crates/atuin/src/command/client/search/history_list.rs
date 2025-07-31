@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use super::engines::SearchEngine;
 use atuin_client::{
     history::History,
     theme::{Meaning, Theme},
 };
 use atuin_common::utils::Escapable as _;
+use itertools::Itertools;
 use ratatui::{
     buffer::Buffer,
     crossterm::style,
@@ -16,6 +18,18 @@ use time::OffsetDateTime;
 
 use super::duration::format_duration;
 
+pub struct MatchHighlighter<'a> {
+    pub engine: &'a dyn SearchEngine,
+    pub search_input: &'a str,
+}
+
+impl MatchHighlighter<'_> {
+    pub fn get_highlight_indices(&self, command: &str) -> Vec<usize> {
+        self.engine
+            .get_highlight_indices(command, self.search_input)
+    }
+}
+
 pub struct HistoryList<'a> {
     history: &'a [History],
     block: Option<Block<'a>>,
@@ -25,6 +39,7 @@ pub struct HistoryList<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     indicator: &'a str,
     theme: &'a Theme,
+    match_highlighter: MatchHighlighter<'a>,
 }
 
 #[derive(Default)]
@@ -78,6 +93,7 @@ impl StatefulWidget for HistoryList<'_> {
             now: &self.now,
             indicator: self.indicator,
             theme: self.theme,
+            match_highlighter: self.match_highlighter,
         };
 
         for item in self.history.iter().skip(state.offset).take(end - start) {
@@ -101,6 +117,7 @@ impl<'a> HistoryList<'a> {
         now: &'a dyn Fn() -> OffsetDateTime,
         indicator: &'a str,
         theme: &'a Theme,
+        match_highlighter: MatchHighlighter<'a>,
     ) -> Self {
         Self {
             history,
@@ -110,6 +127,7 @@ impl<'a> HistoryList<'a> {
             now,
             indicator,
             theme,
+            match_highlighter,
         }
     }
 
@@ -144,6 +162,7 @@ struct DrawState<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     indicator: &'a str,
     theme: &'a Theme,
+    match_highlighter: MatchHighlighter<'a>,
 }
 
 // longest line prefix I could come up with
@@ -166,7 +185,7 @@ impl DrawState<'_> {
         } else {
             &SLICES[i..i + 3]
         };
-        self.draw(prompt, Style::default());
+        self.draw(prompt, Style::default(), false);
     }
 
     fn duration(&mut self, h: &History) {
@@ -176,7 +195,7 @@ impl DrawState<'_> {
             Meaning::AlertError
         });
         let duration = Duration::from_nanos(u64::try_from(h.duration).unwrap_or(0));
-        self.draw(&format_duration(duration), status.into());
+        self.draw(&format_duration(duration), status.into(), true);
     }
 
     #[allow(clippy::cast_possible_truncation)] // we know that time.len() will be <6
@@ -195,33 +214,55 @@ impl DrawState<'_> {
         // skip padding if for some reason it is already too long to align nicely
         let padding =
             usize::from(PREFIX_LENGTH).saturating_sub(usize::from(self.x) + 4 + time.len());
-        self.draw(&SPACES[..padding], Style::default());
+        self.draw(&SPACES[..padding], Style::default(), true);
 
-        self.draw(&time, style.into());
-        self.draw(" ago", style.into());
+        self.draw(&time, style.into(), true);
+        self.draw(" ago", style.into(), true);
     }
 
     fn command(&mut self, h: &History) {
         let mut style = self.theme.as_style(Meaning::Base);
+        let mut selected_row = false;
         if !self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
         {
+            selected_row = true;
             // if not applying alternative highlighting to the whole row, color the command
-            style = self.theme.as_style(Meaning::AlertError);
+            // style = self.theme.as_style(Meaning::AlertError);
             style.attributes.set(style::Attribute::Bold);
         }
 
+        let highlight_indices = self.match_highlighter.get_highlight_indices(
+            h.command
+                .escape_control()
+                .split_ascii_whitespace()
+                .join(" ")
+                .as_str(),
+        );
+        let mut pos = 0;
+
         for section in h.command.escape_control().split_ascii_whitespace() {
-            self.draw(" ", style.into());
-            if self.x > self.list_area.width {
-                // Avoid attempting to draw a command section beyond the width
-                // of the list
-                return;
+            self.draw(" ", style.into(), true);
+            for ch in section.chars() {
+                if self.x > self.list_area.width {
+                    // Avoid attempting to draw a command section beyond the width
+                    // of the list
+                    return;
+                }
+                let mut style = style;
+                if highlight_indices.contains(&pos) {
+                    style = self.theme.as_style(Meaning::AlertError);
+                    if selected_row {
+                        style.attributes.set(style::Attribute::Bold);
+                    }
+                }
+                self.draw(&ch.to_string(), style.into(), true);
+                pos += 1;
             }
-            self.draw(section, style.into());
+            pos += 1;
         }
     }
 
-    fn draw(&mut self, s: &str, mut style: Style) {
+    fn draw(&mut self, s: &str, mut style: Style, highlight_bg: bool) {
         let cx = self.list_area.left() + self.x;
 
         let cy = if self.inverted {
@@ -233,6 +274,12 @@ impl DrawState<'_> {
         if self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
         {
             style = style.add_modifier(Modifier::REVERSED);
+        }
+        if !self.alternate_highlight
+            && (self.y as usize + self.state.offset == self.state.selected)
+            && highlight_bg
+        {
+            style = style.bg(self.theme.get_background_color().into());
         }
 
         let w = (self.list_area.width - self.x) as usize;

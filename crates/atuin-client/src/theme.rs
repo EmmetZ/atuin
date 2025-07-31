@@ -31,6 +31,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    BaseBg,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -167,6 +168,10 @@ impl Theme {
         .collect();
         Theme::new(name, parent.map(|p| p.name.clone()), styles)
     }
+
+    pub fn get_background_color(&self) -> Color {
+        self.styles[&Meaning::BaseBg].foreground_color.unwrap()
+    }
 }
 
 // Use palette to get a color from a string name, if possible
@@ -284,6 +289,10 @@ lazy_static! {
                 ),
                 (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
                 (Meaning::Base, ContentStyle::default()),
+                (
+                    Meaning::BaseBg,
+                    StyleFactory::from_fg_color(Color::DarkGrey),
+                ),
             ]),
         )
     };

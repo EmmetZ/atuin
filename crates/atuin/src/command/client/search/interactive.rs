@@ -24,7 +24,10 @@ use super::{
     history_list::{HistoryList, ListState, PREFIX_LENGTH},
 };
 
-use crate::command::client::theme::{Meaning, Theme};
+use crate::command::client::{
+    search::history_list::MatchHighlighter,
+    theme::{Meaning, Theme},
+};
 use crate::{VERSION, command::client::search::engines};
 
 use ratatui::{
@@ -728,6 +731,10 @@ impl State {
 
         match self.tab_index {
             0 => {
+                let match_highlighter = MatchHighlighter {
+                    engine: self.engine.as_ref(),
+                    search_input: self.search.input.as_str(),
+                };
                 let results_list = Self::build_results_list(
                     style,
                     results,
@@ -735,6 +742,7 @@ impl State {
                     &self.now,
                     indicator.as_str(),
                     theme,
+                    match_highlighter,
                 );
                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
             }
@@ -877,6 +885,7 @@ impl State {
         now: &'a dyn Fn() -> OffsetDateTime,
         indicator: &'a str,
         theme: &'a Theme,
+        match_highlighter: MatchHighlighter<'a>,
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
             results,
@@ -885,6 +894,7 @@ impl State {
             now,
             indicator,
             theme,
+            match_highlighter,
         );
 
         if style.compact {
