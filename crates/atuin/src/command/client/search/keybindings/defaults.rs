@@ -216,6 +216,7 @@ pub fn default_emacs_keymap(settings: &Settings) -> Keymap {
     km.bind(key("ctrl-?"), Action::DeleteCharBefore);
     km.bind(key("ctrl-delete"), Action::DeleteWordAfter);
     km.bind(key("delete"), Action::DeleteCharAfter);
+    km.bind(key("shift-delete"), Action::Delete);
     // ctrl-d: if input empty → return original, otherwise delete char
     km.bind_conditional(
         key("ctrl-d"),
