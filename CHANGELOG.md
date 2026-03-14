@@ -2,6 +2,85 @@
 
 All notable changes to this project will be documented in this file.
 
+## [18.13.2] - 2026-03-13
+
+### Miscellaneous Tasks
+
+- *(release)* Building windows aarch64 was overly optimistic
+- Update changelog
+
+
+## [18.13.1] - 2026-03-13
+
+### Miscellaneous Tasks
+
+- *(release)* Update dist, remove custom runners
+- Update changelog
+
+
+## [18.13.0] - 2026-03-13
+
+### Bug Fixes
+
+- *(deps)* Add use-dev-tty to crossterm in atuin-ai ([#3185](https://github.com/atuinsh/atuin/issues/3185))
+- *(docs)* Update Postgres volume path in Docker as required by pg18 ([#3174](https://github.com/atuinsh/atuin/issues/3174))
+- Systemd Exec for separate server binary ([#3176](https://github.com/atuinsh/atuin/issues/3176))
+- Multiline commands with fish ([#3179](https://github.com/atuinsh/atuin/issues/3179))
+- Silent DB failures e.g. when disk is full ([#3183](https://github.com/atuinsh/atuin/issues/3183))
+- Forward $PATH to tmux popup in zsh ([#3198](https://github.com/atuinsh/atuin/issues/3198))
+- Dramatically decrease daemon memory usage ([#3211](https://github.com/atuinsh/atuin/issues/3211))
+- Regen cargo dist
+- Clear script database before rebuild to prevent unique constraint violation ([#3232](https://github.com/atuinsh/atuin/issues/3232))
+- Support Nushell 0.111 ([#3249](https://github.com/atuinsh/atuin/issues/3249))
+- Ctrl-c not exiting ai ([#3256](https://github.com/atuinsh/atuin/issues/3256))
+
+
+### Documentation
+
+- Update config.md to remove NuShell support note ([#3190](https://github.com/atuinsh/atuin/issues/3190))
+- Document `search.filters` ([#3195](https://github.com/atuinsh/atuin/issues/3195))
+- Clean up doc references for sqlite-based self-hosting ([#3216](https://github.com/atuinsh/atuin/issues/3216))
+- Document daemon-fuzzy search mode ([#3254](https://github.com/atuinsh/atuin/issues/3254))
+
+
+### Features
+
+- *(docs)* Add Shell Integration and Interoperability docs ([#3163](https://github.com/atuinsh/atuin/issues/3163))
+- `switch-context` ([#3149](https://github.com/atuinsh/atuin/issues/3149))
+- Add Hub authentication for future sync + extra features ([#3010](https://github.com/atuinsh/atuin/issues/3010))
+- Add Atuin AI inline CLI MVP ([#3178](https://github.com/atuinsh/atuin/issues/3178))
+- Add autostart and pid management to daemon ([#3180](https://github.com/atuinsh/atuin/issues/3180))
+- Generate commands or ask questions with `atuin ai` ([#3199](https://github.com/atuinsh/atuin/issues/3199))
+- Add history author/intent metadata and v1 record version ([#3205](https://github.com/atuinsh/atuin/issues/3205))
+- In-memory search index with atuin daemon ([#3201](https://github.com/atuinsh/atuin/issues/3201))
+- Update script for smoother setup ([#3230](https://github.com/atuinsh/atuin/issues/3230))
+- Initial draft of atuin-shell ([#3206](https://github.com/atuinsh/atuin/issues/3206))
+- Allow setting multipliers for frequency, recency, and frecency scores ([#3235](https://github.com/atuinsh/atuin/issues/3235))
+- Allow running `atuin search -i` as subcommand ([#3208](https://github.com/atuinsh/atuin/issues/3208))
+- Use pty proxy for rendering tui popups without clearing the terminal ([#3234](https://github.com/atuinsh/atuin/issues/3234))
+- Allow authenticating with Atuin Hub ([#3237](https://github.com/atuinsh/atuin/issues/3237))
+- Initialize Atuin AI by default with `atuin init` ([#3255](https://github.com/atuinsh/atuin/issues/3255))
+- Add `atuin setup` ([#3257](https://github.com/atuinsh/atuin/issues/3257))
+
+
+### Miscellaneous Tasks
+
+- Update changelog
+- Update changelog
+- Update changelog
+- Use workspace versions ([#3210](https://github.com/atuinsh/atuin/issues/3210))
+- Move atuin ai subcommand into core binary ([#3212](https://github.com/atuinsh/atuin/issues/3212))
+- Update changelog
+- Update to Rust 1.94 ([#3247](https://github.com/atuinsh/atuin/issues/3247))
+- Strip symbols in dist profile to reduce binary size
+- Upgrade thiserror 1.x to 2.x to deduplicate dependency
+- Upgrade axum 0.7 to 0.8 to deduplicate with tonic's axum
+- Update changelog
+- Update changelog
+- Update changelog
+- Update changelog
+
+
 ## [18.12.1] - 2026-02-11
 
 ### Bug Fixes

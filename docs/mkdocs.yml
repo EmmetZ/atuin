@@ -29,6 +29,11 @@ theme:
     - content.action.edit
     - content.action.view
 
+# NOTE: to enable ToC and heading anchor links in local (non-multirepo) development,
+# comment out the `multirepo` plugin and all its settings.
+# Note that this changes the top-level directory when developing locally
+# from `/cli/CLI/` to `/cli/.
+
 plugins:
   - search
   - multirepo:
@@ -89,6 +94,9 @@ nav:
       - Docker: self-hosting/docker.md
       - Kubernetes: self-hosting/kubernetes.md
       - Systemd: self-hosting/systemd.md
+  - AI:
+      - Introduction: ai/introduction.md
+      - Settings: ai/settings.md
   - Known Issues: known-issues.md
   - Integrations: integrations.md
   - FAQ: faq.md
