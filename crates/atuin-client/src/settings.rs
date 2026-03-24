@@ -29,6 +29,26 @@ pub(crate) mod meta;
 mod scripts;
 pub mod watcher;
 
+pub struct HubEndpoint(String);
+
+/// Default sync address for Atuin's hosted service
+pub const DEFAULT_SYNC_ADDRESS: &str = "https://api.atuin.sh";
+
+/// Default Hub web/API endpoint for Atuin's hosted service
+pub const DEFAULT_HUB_ENDPOINT: &str = "https://hub.atuin.sh";
+
+impl Default for HubEndpoint {
+    fn default() -> Self {
+        HubEndpoint(DEFAULT_HUB_ENDPOINT.to_string())
+    }
+}
+
+impl AsRef<str> for HubEndpoint {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Copy, ValueEnum, PartialEq, Serialize)]
 pub enum SearchMode {
     #[serde(rename = "prefix")]
@@ -363,6 +383,45 @@ pub enum SyncProtocol {
     Auto,
 }
 
+/// Resolved authentication state for sync operations.
+///
+/// Determined at runtime by examining which tokens are available and what
+/// server the client is configured to talk to. Operations use this to pick
+/// the right auth header and endpoint style.
+#[cfg(feature = "sync")]
+#[derive(Debug, Clone)]
+pub enum SyncAuth {
+    /// Self-hosted Rust server. Uses `Authorization: Token <session>` and
+    /// legacy endpoints.
+    Legacy { token: String },
+    /// Hub with a valid Hub API token (`atapi_*`). Uses
+    /// `Authorization: Bearer <token>` and v0 endpoints.
+    Hub { token: String },
+    /// Targeting Hub but only has a CLI session token. Uses
+    /// `Authorization: Token <session>` against compat/record endpoints.
+    /// Sync, password change, and account deletion still work, but the user
+    /// should be nudged to run `atuin login` for full Hub auth.
+    HubViaCli { token: String },
+    /// Not authenticated at all. Contains an actionable user-facing message.
+    NotLoggedIn { reason: String },
+}
+
+#[cfg(feature = "sync")]
+impl SyncAuth {
+    /// Convert into the auth token type used by the API client.
+    ///
+    /// Returns an error with an actionable message for `NotLoggedIn`.
+    pub fn into_auth_token(self) -> Result<crate::api_client::AuthToken> {
+        use crate::api_client::AuthToken;
+        match self {
+            SyncAuth::Legacy { token } => Ok(AuthToken::Token(token)),
+            SyncAuth::Hub { token } => Ok(AuthToken::Bearer(token)),
+            SyncAuth::HubViaCli { token } => Ok(AuthToken::Token(token)),
+            SyncAuth::NotLoggedIn { reason } => Err(eyre!(reason)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Default, Serialize)]
 pub struct Keys {
     pub scroll_exits: bool,
@@ -595,7 +654,7 @@ pub struct Logs {
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
 pub struct Ai {
     /// Whether or not the AI features are enabled.
-    pub enabled: bool,
+    pub enabled: Option<bool>,
 
     /// The address of the Atuin AI endpoint. Used for AI features like command generation.
     /// Only necessary for custom AI endpoints.
@@ -1176,12 +1235,6 @@ impl Settings {
         }
     }
 
-    /// Default sync address for Atuin's hosted service
-    pub const DEFAULT_SYNC_ADDRESS: &'static str = "https://api.atuin.sh";
-
-    /// Default Hub web/API endpoint for Atuin's hosted service
-    pub const DEFAULT_HUB_ENDPOINT: &'static str = "https://hub.atuin.sh";
-
     /// Normalize a URL for comparison by trimming trailing slashes
     fn normalize_url(url: &str) -> &str {
         url.trim_end_matches('/')
@@ -1190,8 +1243,8 @@ impl Settings {
     /// Check if a URL matches one of Atuin's official hosted addresses
     fn is_official_address(url: &str) -> bool {
         let normalized = Self::normalize_url(url);
-        normalized == Self::normalize_url(Self::DEFAULT_SYNC_ADDRESS)
-            || normalized == Self::normalize_url(Self::DEFAULT_HUB_ENDPOINT)
+        normalized == Self::normalize_url(DEFAULT_SYNC_ADDRESS)
+            || normalized == Self::normalize_url(DEFAULT_HUB_ENDPOINT)
     }
 
     /// Returns whether this configuration uses Hub-style sync.
@@ -1213,50 +1266,84 @@ impl Settings {
     /// For Atuin's official hosted service, this always returns `https://hub.atuin.sh`
     /// regardless of whether `sync_address` is `api.atuin.sh` or `hub.atuin.sh`.
     /// For self-hosted instances, returns the configured `sync_address`.
-    pub fn active_hub_endpoint(&self) -> Option<String> {
+    pub fn active_hub_endpoint(&self) -> Option<HubEndpoint> {
         if self.is_hub_sync() {
             if Self::is_official_address(&self.sync_address) {
-                Some(Self::DEFAULT_HUB_ENDPOINT.to_string())
+                Some(HubEndpoint::default())
             } else {
-                Some(self.sync_address.clone())
+                Some(HubEndpoint(self.sync_address.clone()))
             }
         } else {
             None
         }
     }
 
-    /// Returns the best available auth token for sync operations.
+    /// Examines the configured sync target and available tokens to determine
+    /// the correct auth strategy. Also performs cleanup of mis-stored tokens
+    /// (e.g. a CLI token incorrectly saved in the Hub session slot).
+    #[cfg(feature = "sync")]
+    pub async fn resolve_sync_auth(&self) -> SyncAuth {
+        let meta = match Self::meta_store().await {
+            Ok(m) => m,
+            Err(e) => {
+                return SyncAuth::NotLoggedIn {
+                    reason: format!("Failed to open meta store: {e}"),
+                };
+            }
+        };
+
+        if !self.is_hub_sync() {
+            // Self-hosted / legacy server
+            return match meta.session_token().await {
+                Ok(Some(token)) => SyncAuth::Legacy { token },
+                _ => SyncAuth::NotLoggedIn {
+                    reason: "Not logged in. Run 'atuin login' to authenticate \
+                             with your sync server."
+                        .into(),
+                },
+            };
+        }
+
+        // Targeting Hub — check for a valid Hub API token first
+        if let Ok(Some(hub_token)) = meta.hub_session_token().await {
+            if hub_token.starts_with("atapi_") {
+                return SyncAuth::Hub { token: hub_token };
+            }
+
+            // A non-atapi_ token in the hub_session slot is a mis-stored CLI
+            // token (from the migration-fallback bug). Move it to the CLI
+            // session slot if that slot is empty, then clear hub_session
+            // only if the move succeeded.
+            if let Ok(None) = meta.session_token().await {
+                if meta.save_session(&hub_token).await.is_ok() {
+                    let _ = meta.delete_hub_session().await;
+                }
+            } else {
+                // CLI slot already has a token; just clear the bad hub_session
+                let _ = meta.delete_hub_session().await;
+            }
+            // Fall through to check CLI token below
+        }
+
+        // No valid Hub token — check for a CLI session token
+        match meta.session_token().await {
+            Ok(Some(token)) => SyncAuth::HubViaCli { token },
+            _ => SyncAuth::NotLoggedIn {
+                reason: "Not logged in. Run 'atuin login' or 'atuin register' \
+                         to authenticate."
+                    .into(),
+            },
+        }
+    }
+
+    /// Returns the appropriate auth token for sync operations.
     ///
-    /// Token priority when using Hub sync:
-    /// 1. Hub token (Bearer) - enables unified Hub auth
-    /// 2. CLI session token (Token) - fallback if Hub token revoked
-    ///
-    /// For legacy/self-hosted sync, only CLI session token is used.
-    ///
-    /// Hub tokens are preferred when available because they provide unified
-    /// authentication across CLI and Hub features, and users can manage them
-    /// via the Hub web interface.
+    /// Delegates to [`resolve_sync_auth`] and converts the result to an
+    /// `AuthToken`. Callers that need to distinguish between auth states
+    /// (e.g. to show different UI) should call `resolve_sync_auth` directly.
     #[cfg(feature = "sync")]
     pub async fn sync_auth_token(&self) -> Result<crate::api_client::AuthToken> {
-        use crate::api_client::AuthToken;
-
-        let meta = Self::meta_store().await?;
-
-        // Try Hub token first if we're using Hub sync
-        if self.is_hub_sync()
-            && let Some(hub_token) = meta.hub_session_token().await?
-        {
-            return Ok(AuthToken::Bearer(hub_token));
-        }
-
-        // Fall back to CLI session token
-        match meta.session_token().await? {
-            Some(token) => Ok(AuthToken::Token(token)),
-            None => Err(eyre!(
-                "Not logged in - no Hub session or CLI session found. \
-                 Run 'atuin login' or 'atuin register' to authenticate."
-            )),
-        }
+        self.resolve_sync_auth().await.into_auth_token()
     }
 
     #[cfg(feature = "check-update")]
@@ -1436,7 +1523,6 @@ impl Settings {
             .set_default("search.frequency_score_multiplier", 1.0)?
             .set_default("search.frecency_score_multiplier", 1.0)?
             .set_default("meta.db_path", meta_path.to_str())?
-            .set_default("ai.enabled", false)?
             .set_default("ai.send_cwd", false)?
             .set_default(
                 "search.filters",

@@ -4,6 +4,7 @@ use crate::tui::{
     App, AppEvent, AppMode, ConversationEvent, EventLoop, ExitAction, RenderContext, TerminalGuard,
     calculate_needed_height, install_panic_hook,
 };
+use atuin_client::distro::detect_linux_distribution;
 use atuin_client::theme::ThemeManager;
 use atuin_common::tls::ensure_crypto_provider;
 use crossterm::{
@@ -26,7 +27,7 @@ pub async fn run(
     settings: &atuin_client::settings::Settings,
     output_for_hook: bool,
 ) -> Result<()> {
-    if !settings.ai.enabled {
+    if !settings.ai.enabled.unwrap_or(false) {
         emit_shell_result(
             Action::Print(
                 "Atuin AI is not enabled. Please enable it in your settings or run `atuin setup`."
@@ -56,12 +57,12 @@ pub async fn run(
     let token = if let Some(token) = &api_token {
         token.to_string()
     } else {
-        // If no token is provided, assume we're using Hub as the endpoint if we're using Hub sync
-        if settings.is_hub_sync() {
-            ensure_hub_session(settings).await?
-        } else {
-            bail!("No API token provided in ai.api_token settings or command line argument.")
-        }
+        // ensure_hub_session will authenticate against settings.active_hub_endpoint().unwrap_or_default(),
+        // which is the default Hub endpoint if no endpoint is provided
+        //
+        // TODO[mkt]: Atuin AI and the Hub sync endpoint are too tightly coupled;
+        // current setup means that Hub endpoint controls auth while AI endpoint controls AI conversations
+        ensure_hub_session(settings).await?
     };
 
     let action = run_inline_tui(
@@ -84,9 +85,7 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
         return Ok(token);
     }
 
-    let hub_address = settings
-        .active_hub_endpoint()
-        .unwrap_or("https://hub.atuin.sh".to_string());
+    let hub_address = settings.active_hub_endpoint().unwrap_or_default();
 
     let will_sync = settings.is_hub_sync();
 
@@ -109,7 +108,7 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
     debug!("Starting Atuin Hub authentication...");
 
     println!("Authenticating with Atuin Hub...");
-    let session = atuin_client::hub::HubAuthSession::start(&hub_address).await?;
+    let session = atuin_client::hub::HubAuthSession::start(hub_address.as_ref()).await?;
     println!("Open this URL to continue:");
     println!("{}", session.auth_url);
 
@@ -130,7 +129,7 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
         && let Ok(Some(cli_token)) = meta.session_token().await
     {
         debug!("CLI session found, attempting to link accounts");
-        if let Err(e) = atuin_client::hub::link_account(&hub_address, &cli_token).await {
+        if let Err(e) = atuin_client::hub::link_account(hub_address.as_ref(), &cli_token).await {
             // Don't fail AI flow if linking fails - it's not critical
             debug!("Could not link CLI account to Hub: {}", e);
         } else {
@@ -187,16 +186,25 @@ fn create_chat_stream(
 
         debug!("Sending SSE request to {endpoint}");
 
+        let os = detect_os();
+        let shell = detect_shell();
+
+        let mut context = serde_json::json!({
+            "os": os,
+            "shell": shell,
+            "pwd": if send_cwd { std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()) } else { None },
+        });
+
+        if os == "linux" {
+            context["distro"] = serde_json::json!(detect_linux_distribution());
+        }
+
         // Build request body
         let mut request_body = serde_json::json!({
             "messages": messages,
-            "context": {
-                "os": detect_os(),
-                "shell": detect_shell(),
-                "pwd": if send_cwd { std::env::current_dir()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned()) } else { None },
-            }
+            "context": context,
         });
 
         // Include session_id only if present (not on first request)
@@ -333,7 +341,7 @@ fn detect_os() -> String {
         "macos" => "macos".to_string(),
         "linux" => "linux".to_string(),
         "windows" => "windows".to_string(),
-        _ => "linux".to_string(),
+        other => format!("Other: {other}"),
     }
 }
 
@@ -449,7 +457,7 @@ async fn run_inline_tui(
     #[cfg(unix)]
     let mut popup_state = crate::tui::popup::try_setup_popup();
     #[cfg(not(unix))]
-    let mut popup_state: Option<()> = None;
+    let popup_state: Option<()> = None;
 
     let popup_mode = popup_state.is_some();
 
