@@ -144,12 +144,14 @@ New-Module -Name Atuin -ScriptBlock {
             # Start-Process does some crazy stuff, just use the Process class directly to have more control.
             $process = New-Object System.Diagnostics.Process
             $process.StartInfo.FileName = "atuin"
-            $process.StartInfo.Arguments = "search -i --result-file ""$resultFile"" $ExtraArgs"
+            $process.StartInfo.Arguments = "search -i --result-file ""$($resultFile.FullName)"" $ExtraArgs"
             $process.StartInfo.UseShellExecute = $false
             $process.StartInfo.RedirectStandardError = $true
             $process.StartInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $process.StartInfo.EnvironmentVariables["ATUIN_SHELL"] = "powershell"
             $process.StartInfo.EnvironmentVariables["ATUIN_QUERY"] = Get-CommandLine
+            # PowerShell's Set-Location (cd) doesn't update the process-level working directory, set it explicitly
+            $process.StartInfo.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
 
             try {
                 $process.Start() | Out-Null
@@ -159,7 +161,7 @@ New-Module -Name Atuin -ScriptBlock {
                 $errorOutput = $process.StandardError.ReadToEnd().Trim()
                 $process.WaitForExit()
 
-                $suggestion = (Get-Content -Raw $resultFile -Encoding UTF8 | Out-String).Trim()
+                $suggestion = (Get-Content -LiteralPath $resultFile.FullName -Raw -Encoding UTF8 | Out-String).Trim()
             }
             catch {
                 $errorOutput = $_
@@ -203,7 +205,7 @@ New-Module -Name Atuin -ScriptBlock {
         }
         finally {
             [System.Console]::OutputEncoding = $previousOutputEncoding
-            Remove-Item $resultFile
+            $resultFile.Delete()
         }
     }
 
