@@ -49,10 +49,12 @@ mod account;
 #[cfg(feature = "daemon")]
 mod daemon;
 
+mod config;
 mod default_config;
 mod doctor;
 mod dotfiles;
 mod history;
+mod hook;
 mod import;
 mod info;
 mod init;
@@ -74,6 +76,9 @@ pub enum Cmd {
     /// Manipulate shell history
     #[command(subcommand)]
     History(history::Cmd),
+
+    /// Manage AI-agent shell hooks
+    Hook(hook::Cmd),
 
     /// Import shell history from file
     #[command(subcommand)]
@@ -133,6 +138,9 @@ pub enum Cmd {
     #[command()]
     DefaultConfig,
 
+    #[command(subcommand)]
+    Config(config::Cmd),
+
     /// Run the AI assistant
     #[cfg(feature = "ai")]
     #[command(subcommand)]
@@ -150,11 +158,21 @@ impl Cmd {
             daemon::daemonize_current_process()?;
         }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        #[cfg(feature = "ai")]
+        let mut runtime = if matches!(&self, Self::Ai(_)) {
+            tokio::runtime::Builder::new_multi_thread()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
 
+        #[cfg(not(feature = "ai"))]
+        let mut runtime = tokio::runtime::Builder::new_current_thread();
+
+        let runtime = runtime.enable_all().build().unwrap();
+
+        // For non-history commands, we want to initialize logging and the theme manager before
+        // doing anything else. History commands are performance-sensitive and run before and after
+        // every shell command, so we want to skip any unnecessary initialization for them.
         let settings = Settings::new().wrap_err("could not load client settings")?;
         let theme_manager = theme::ThemeManager::new(settings.theme.debug, None);
         let res = runtime.block_on(self.run_inner(settings, theme_manager));
@@ -164,7 +182,7 @@ impl Cmd {
         res
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::future_not_send)]
     async fn run_inner(
         self,
         mut settings: Settings,
@@ -323,8 +341,10 @@ impl Cmd {
         // runs
         match self {
             Self::History(history) => return history.run(&settings).await,
+            Self::Hook(hook) => return hook.run(&settings).await,
             Self::Init(init) => return init.run(&settings).await,
             Self::Doctor => return doctor::run(&settings).await,
+            Self::Config(config) => return config.run(&settings).await,
             _ => {}
         }
 
@@ -372,7 +392,9 @@ impl Cmd {
             #[cfg(feature = "daemon")]
             Self::Daemon(cmd) => cmd.run(settings, sqlite_store, db).await,
 
-            Self::History(_) | Self::Init(_) | Self::Doctor => unreachable!(),
+            Self::History(_) | Self::Hook(_) | Self::Init(_) | Self::Doctor | Self::Config(_) => {
+                unreachable!()
+            }
 
             #[cfg(feature = "ai")]
             Self::Ai(cli) => atuin_ai::commands::run(cli, &settings).await,

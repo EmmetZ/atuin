@@ -131,6 +131,11 @@ pub struct Cmd {
     #[arg(long = "inline-height")]
     inline_height: Option<u16>,
 
+    /// Filter by author. Supports $all-user (non-agents), $all-agent, or literal names.
+    /// Can be specified multiple times.
+    #[arg(long)]
+    author: Option<Vec<String>>,
+
     /// Include duplicate commands in the output (non-interactive only)
     #[arg(long)]
     include_duplicates: bool,
@@ -248,6 +253,7 @@ impl Cmd {
                 offset: self.offset,
                 reverse: self.reverse,
                 include_duplicates: self.include_duplicates,
+                authors: self.author.clone().unwrap_or_default(),
             };
 
             let mut entries =
@@ -265,14 +271,10 @@ impl Cmd {
                 while !entries.is_empty() {
                     for entry in &entries {
                         eprintln!("deleting {}", entry.id);
-
-                        if settings.sync.records {
-                            let (id, _) = history_store.delete(entry.id.clone()).await?;
-                            history_store.incremental_build(&db, &[id]).await?;
-                        } else {
-                            db.delete(entry.clone()).await?;
-                        }
                     }
+
+                    let ids = history_store.delete_entries(entries).await?;
+                    history_store.incremental_build(&db, &ids).await?;
 
                     entries =
                         run_non_interactive(settings, opt_filter.clone(), &query, &db).await?;
@@ -359,5 +361,15 @@ mod tests {
         assert!(cmd.is_ok());
         let cmd = cmd.unwrap();
         assert_eq!(cmd.query, Some(vec!["--foo".to_string()]));
+    }
+
+    #[test]
+    fn search_author_cli_flag() {
+        let cmd =
+            Cmd::try_parse_from(["search", "--author", "codex", "--author", "ellie"]).unwrap();
+        assert_eq!(
+            cmd.author,
+            Some(vec!["codex".to_string(), "ellie".to_string()])
+        );
     }
 }

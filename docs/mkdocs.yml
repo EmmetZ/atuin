@@ -70,6 +70,7 @@ nav:
       - Basic usage: guide/basic-usage.md
       - Advanced usage: guide/advanced-usage.md
       - Shell Integration: guide/shell-integration.md
+      - AI Agent Hooks: guide/agent-hooks.md
       - Deleting history: guide/delete-history.md
       - Syncing dotfiles: guide/dotfiles.md
       - Theming: guide/theming.md
@@ -78,8 +79,9 @@ nav:
       - Key Binding: configuration/key-binding.md
       - Advanced Key Binding: configuration/advanced-key-binding.md
   - Reference:
-      - doctor: reference/doctor.md
+      - config: reference/config.md
       - daemon: reference/daemon.md
+      - doctor: reference/doctor.md
       - gen-completions: reference/gen-completions.md
       - hex: reference/hex.md
       - import: reference/import.md
@@ -98,6 +100,7 @@ nav:
   - AI:
       - Introduction: ai/introduction.md
       - Settings: ai/settings.md
+      - "Tools & Permissions": ai/tools-permissions.md
   - Known Issues: known-issues.md
   - Integrations: integrations.md
   - FAQ: faq.md

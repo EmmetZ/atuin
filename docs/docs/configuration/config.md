@@ -576,6 +576,33 @@ frequency_score_multiplier = 0.8
 frecency_score_multiplier = 2.0
 ```
 
+#### `authors`
+
+Default: `["$all-user"]`
+
+Filter search results by command author. This controls which commands appear in interactive search based on who (or what) ran them. Useful when AI coding agents are recording commands via [agent hooks](../guide/agent-hooks.md).
+
+Special values:
+
+| Value | Meaning |
+|-------|---------|
+| `$all-user` | Commands from any author that is **not** a known AI agent |
+| `$all-agent` | Commands from any known AI agent |
+
+You can also use literal author names like `"claude-code"`, `"codex"`, or `"pi"`.
+
+```toml
+[search]
+# Default: only show human-authored commands
+authors = ["$all-user"]
+
+# Show everything (no author filtering)
+# authors = []
+
+# Show commands from you and Claude Code
+# authors = ["$all-user", "claude-code"]
+```
+
 ## Stats
 
 This section of client config is specifically for configuring Atuin stats calculations
@@ -700,7 +727,9 @@ Atuin version: > 18.3
 
 Default: `a`
 
-Which key to use as the prefix
+Which key to use as the prefix. Prefix mode is a two-step shortcut system: you press ++ctrl++ and the prefix key to enter prefix mode, then press a second key to trigger an action. For example, with the default prefix `a`, pressing ++ctrl+a++ then ++d++ deletes the selected entry.
+
+See the [key binding page](key-binding.md#prefix-mode) for the full list of default prefix shortcuts, or the [advanced key binding page](advanced-key-binding.md#custom-prefix-bindings) to customize them.
 
 ### `exit_past_line_start`
 

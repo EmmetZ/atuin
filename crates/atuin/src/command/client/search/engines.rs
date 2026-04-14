@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use atuin_client::{
-    database::{Context, Database},
-    history::{History, HistoryId},
+    database::{Context, Database, OptFilters},
+    history::{AUTHOR_FILTER_ALL_USER, History, HistoryId},
     settings::{FilterMode, SearchMode, Settings},
 };
 use eyre::Result;
@@ -73,7 +73,17 @@ pub trait SearchEngine: Send + Sync + 'static {
     async fn query(&mut self, state: &SearchState, db: &mut dyn Database) -> Result<Vec<History>> {
         if state.input.as_str().is_empty() {
             Ok(db
-                .list(&[state.filter_mode], &state.context, Some(200), true, false)
+                .search(
+                    SearchMode::FullText,
+                    state.filter_mode,
+                    &state.context,
+                    "",
+                    OptFilters {
+                        limit: Some(200),
+                        authors: vec![AUTHOR_FILTER_ALL_USER.to_string()],
+                        ..Default::default()
+                    },
+                )
                 .await?
                 .into_iter()
                 .collect::<Vec<_>>())

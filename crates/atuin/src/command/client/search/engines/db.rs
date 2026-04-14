@@ -4,7 +4,7 @@ use atuin_client::{
     database::Database,
     database::OptFilters,
     database::{QueryToken, QueryTokenizer},
-    history::History,
+    history::{AUTHOR_FILTER_ALL_USER, History},
     settings::SearchMode,
 };
 use eyre::Result;
@@ -31,6 +31,7 @@ impl SearchEngine for Search {
                 state.input.as_str(),
                 OptFilters {
                     limit: Some(200),
+                    authors: vec![AUTHOR_FILTER_ALL_USER.to_string()],
                     ..Default::default()
                 },
             )

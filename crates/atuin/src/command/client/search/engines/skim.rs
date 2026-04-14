@@ -1,7 +1,11 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use atuin_client::{database::Database, history::History, settings::FilterMode};
+use atuin_client::{
+    database::Database,
+    history::{History, is_known_agent},
+    settings::FilterMode,
+};
 use eyre::Result;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use itertools::Itertools;
@@ -71,6 +75,9 @@ async fn fuzzy_search(
     for (i, (history, count)) in all_history.iter().enumerate() {
         if i % 256 == 0 {
             yield_now().await;
+        }
+        if is_known_agent(&history.author) {
+            continue;
         }
         let context = &state.context;
         let git_root = context

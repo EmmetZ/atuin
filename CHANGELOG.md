@@ -2,7 +2,83 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## 18.14.1
+
+### Bug Fixes
+
+- Ensure we can publish to crates ([#3403](https://github.com/atuinsh/atuin/issues/3403))
+- Thread remote and content_length through system for server tool calls ([#3404](https://github.com/atuinsh/atuin/issues/3404))
+
+
+### Documentation
+
+- Add Tools & Permissions doc section ([#3402](https://github.com/atuinsh/atuin/issues/3402))
+
+
+## 18.14.0
+
+### Bug Fixes
+
+- *(ui)* Make preview line breaking algorithm aware of CJK double-width characters ([#3360](https://github.com/atuinsh/atuin/issues/3360))
+- *(ui)* When inverted, invert scroll events handling ([#3373](https://github.com/atuinsh/atuin/issues/3373))
+- Replace `e>|` with `|` in nushell integration to restore history recording ([#3358](https://github.com/atuinsh/atuin/issues/3358))
+- Resolve git worktrees to main repo in workspace filter ([#3366](https://github.com/atuinsh/atuin/issues/3366))
+- Ensure daemon is running ([#3384](https://github.com/atuinsh/atuin/issues/3384))
+
+
+### Documentation
+
+- Remove docker-compose duplication ([#3376](https://github.com/atuinsh/atuin/issues/3376))
+- Cover prefix mode properly ([#3383](https://github.com/atuinsh/atuin/issues/3383))
+- Minor readability improvement to README ([#3381](https://github.com/atuinsh/atuin/issues/3381))
+
+
+### Features
+
+- Opt-in to sharing last command with ai ([#3367](https://github.com/atuinsh/atuin/issues/3367))
+- Add 'atuin config' subcommand for reading and setting config values ([#3368](https://github.com/atuinsh/atuin/issues/3368))
+- Option to disable mouse support ([#3372](https://github.com/atuinsh/atuin/issues/3372))
+- Add support for deleting all matching commands via keybindings ([#3375](https://github.com/atuinsh/atuin/issues/3375))
+- Add strip_trailing_whitespace, on by default ([#3390](https://github.com/atuinsh/atuin/issues/3390))
+- Client-tool execution + permission system ([#3370](https://github.com/atuinsh/atuin/issues/3370))
+- Add history tail for live monitoring view ([#3389](https://github.com/atuinsh/atuin/issues/3389))
+- Track coding agent shell usage ([#3388](https://github.com/atuinsh/atuin/issues/3388))
+- Remove agent search from tui ([#3397](https://github.com/atuinsh/atuin/issues/3397))
+- Add pi hook installer ([#3398](https://github.com/atuinsh/atuin/issues/3398))
+- Autoinstall ai shell history hooks ([#3399](https://github.com/atuinsh/atuin/issues/3399))
+
+
+### Miscellaneous Tasks
+
+- Update to eye-declare 0.3.0 ([#3365](https://github.com/atuinsh/atuin/issues/3365))
+- Prepare 18.14.0-beta.1 release ([#3393](https://github.com/atuinsh/atuin/issues/3393))
+
+
+### Refactor
+
+- Rename examples -> contrib ([#3400](https://github.com/atuinsh/atuin/issues/3400))
+
+
+## 18.13.6
+
+### Bug Fixes
+
+- *(powershell)* Handle non-FileSystem drives ([#3353](https://github.com/atuinsh/atuin/issues/3353))
+- Remove unnecessary arboard/image-data default feature ([#3345](https://github.com/atuinsh/atuin/issues/3345))
+- Use printf to append fish shell init block ([#3346](https://github.com/atuinsh/atuin/issues/3346))
+- Set WorkingDirectory in PowerShell Invoke-AtuinSearch ([#3351](https://github.com/atuinsh/atuin/issues/3351))
+
+
+### Features
+
+- Use eye-declare for more performant and flexible AI TUI ([#3343](https://github.com/atuinsh/atuin/issues/3343))
+
+
+### Miscellaneous Tasks
+
+- *(ci)* Switch most workflows to depot ci ([#3352](https://github.com/atuinsh/atuin/issues/3352))
+- Prepare 18.13.6 release ([#3356](https://github.com/atuinsh/atuin/issues/3356))
+
 
 ## 18.13.5
 
@@ -16,12 +92,19 @@ All notable changes to this project will be documented in this file.
 - Fix duplicated word in Kubernetes guide ([#3338](https://github.com/atuinsh/atuin/issues/3338))
 
 
+### Miscellaneous Tasks
+
+- Prepare 18.13.5 ([#3342](https://github.com/atuinsh/atuin/issues/3342))
+
+
 ## 18.13.4
 
 ### Bug Fixes
 
 - *(ai)* Restore url-quote-magic for ? in zsh ([#3304](https://github.com/atuinsh/atuin/issues/3304))
+- Redirect tty0 when running setup
 - Redirect tty0 when running setup ([#3302](https://github.com/atuinsh/atuin/issues/3302))
+- Call ensure_hub_session even if primary sync endpoint is self-hosted
 - Call ensure_hub_session even if primary sync endpoint is self-hosted ([#3301](https://github.com/atuinsh/atuin/issues/3301))
 - Remove per-event mouse capture toggling that leaked ANSI to stdout ([#3299](https://github.com/atuinsh/atuin/issues/3299))
 - Clarify what data is sent when using Atuin AI during setup (only OS and shell) ([#3290](https://github.com/atuinsh/atuin/issues/3290))
@@ -33,6 +116,7 @@ All notable changes to this project will be documented in this file.
 ### Documentation
 
 - Fix typo in FAQ alternatives section ([#3292](https://github.com/atuinsh/atuin/issues/3292))
+- Remove 'experimental' status from Atuin Daemon
 - Remove 'experimental' status from Atuin Daemon ([#3295](https://github.com/atuinsh/atuin/issues/3295))
 - Add inline_height_shell_up_key_binding ([#3270](https://github.com/atuinsh/atuin/issues/3270))
 
