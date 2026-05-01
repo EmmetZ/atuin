@@ -16,6 +16,7 @@ pub(crate) struct ToolDescriptor {
     /// Past-tense verb for summaries (e.g. "Read file").
     pub past_verb: &'static str,
     /// Whether this tool is executed client-side (by the CLI).
+    #[expect(dead_code)]
     pub is_client: bool,
 }
 
@@ -30,9 +31,18 @@ pub(crate) const READ: &ToolDescriptor = &ToolDescriptor {
     is_client: true,
 };
 
+pub(crate) const EDIT: &ToolDescriptor = &ToolDescriptor {
+    canonical_names: &["edit_file"],
+    capability: Some("client_v1_edit_file"),
+    display_verb: "edit",
+    progressive_verb: "Editing file...",
+    past_verb: "Edited file",
+    is_client: true,
+};
+
 pub(crate) const WRITE: &ToolDescriptor = &ToolDescriptor {
-    canonical_names: &["str_replace", "file_create", "file_insert"],
-    capability: Some("client_v1_write"),
+    canonical_names: &["write_file"],
+    capability: Some("client_v1_write_file"),
     display_verb: "write to",
     progressive_verb: "Writing file...",
     past_verb: "Wrote file",
@@ -41,7 +51,7 @@ pub(crate) const WRITE: &ToolDescriptor = &ToolDescriptor {
 
 pub(crate) const SHELL: &ToolDescriptor = &ToolDescriptor {
     canonical_names: &["execute_shell_command"],
-    capability: Some("client_v1_shell"),
+    capability: Some("client_v1_execute_shell_command"),
     display_verb: "run",
     progressive_verb: "Running command...",
     past_verb: "Ran command",
@@ -54,6 +64,15 @@ pub(crate) const ATUIN_HISTORY: &ToolDescriptor = &ToolDescriptor {
     display_verb: "search your Atuin history for",
     progressive_verb: "Searching...",
     past_verb: "Searched",
+    is_client: true,
+};
+
+pub(crate) const LOAD_SKILL: &ToolDescriptor = &ToolDescriptor {
+    canonical_names: &["load_skill"],
+    capability: Some("client_v1_load_skill"),
+    display_verb: "load skill",
+    progressive_verb: "Loading skill...",
+    past_verb: "Loaded skill",
     is_client: true,
 };
 
@@ -81,9 +100,11 @@ pub(crate) const SERVER_SCRAPE: &ToolDescriptor = &ToolDescriptor {
 /// All known tool descriptors, for lookup by name.
 const ALL_DESCRIPTORS: &[&ToolDescriptor] = &[
     READ,
+    EDIT,
     WRITE,
     SHELL,
     ATUIN_HISTORY,
+    LOAD_SKILL,
     SERVER_SEARCH,
     SERVER_SCRAPE,
 ];

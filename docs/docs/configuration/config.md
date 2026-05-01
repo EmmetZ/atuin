@@ -355,7 +355,7 @@ This supports regular expressions, so you can hide pretty much whatever you want
 
 ```toml
 ## Note that these regular expressions are unanchored, i.e. if they don't start
-## with ^ or end with $, they'll match anywhere in the command.
+## with ^ or end with $, they'll match anywhere in the path.
 # cwd_filter = [
 #   "^/very/secret/directory",
 # ]
@@ -408,6 +408,14 @@ macOS does not have an ++alt++ key, although terminal emulators can often be con
 # Use Ctrl-0 .. Ctrl-9 instead of Alt-0 .. Alt-9 UI shortcuts
 ctrl_n_shortcuts = true
 ```
+
+### show_numeric_shortcuts
+
+Atuin version: >= 18.9
+
+Default: `true`
+
+Whether to show numeric shortcuts (1..9) beside list items in the TUI. Set this to `false` to hide the moving numbers if you find them distracting.
 
 ### `network_timeout`
 
