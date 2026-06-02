@@ -1377,7 +1377,7 @@ impl Drop for TerminalWriter {
     }
 }
 
-/// Screen state captured from atuin-hex's screen server.
+/// Screen state captured from atuin pty-proxy's screen server.
 #[cfg(unix)]
 struct SavedScreen {
     #[allow(dead_code)]
@@ -1390,7 +1390,7 @@ struct SavedScreen {
     rows_data: Vec<Vec<u8>>,
 }
 
-/// Connect to atuin-hex's Unix socket and fetch the current screen state.
+/// Connect to atuin pty-proxy's Unix socket and fetch the current screen state.
 ///
 /// The wire format is:
 /// ```text
@@ -1447,7 +1447,7 @@ fn fetch_screen_state(socket_path: &str) -> Option<SavedScreen> {
 
 /// Restore the screen area that was covered by the popup.
 ///
-/// Writes the pre-formatted per-row ANSI bytes received from atuin-hex
+/// Writes the pre-formatted per-row ANSI bytes received from atuin pty-proxy
 /// directly to stdout, which correctly handles wide characters, colors, and
 /// all text attributes without needing a client-side vt100 parser.
 #[cfg(unix)]
@@ -1532,17 +1532,29 @@ impl Stdout {
 impl Drop for Stdout {
     fn drop(&mut self) {
         #[cfg(not(target_os = "windows"))]
-        execute!(self.writer, PopKeyboardEnhancementFlags).unwrap();
-
-        if !self.inline_mode {
-            execute!(self.writer, terminal::LeaveAlternateScreen).unwrap();
+        if let Err(e) = execute!(self.writer, PopKeyboardEnhancementFlags) {
+            tracing::error!(?e, "Failed to pop keyboard enhancement flags");
         }
-        if !self.no_mouse {
-            execute!(self.writer, event::DisableMouseCapture).unwrap();
-        }
-        execute!(self.writer, event::DisableBracketedPaste).unwrap();
 
-        terminal::disable_raw_mode().unwrap();
+        if !self.inline_mode
+            && let Err(e) = execute!(self.writer, terminal::LeaveAlternateScreen)
+        {
+            tracing::error!(?e, "Failed to leave alt screen mode");
+        }
+
+        if !self.no_mouse
+            && let Err(e) = execute!(self.writer, event::DisableMouseCapture)
+        {
+            tracing::error!(?e, "Failed to disable mouse capture");
+        }
+
+        if let Err(e) = execute!(self.writer, event::DisableBracketedPaste) {
+            tracing::error!(?e, "Failed to disable bracketed paste");
+        }
+
+        if let Err(e) = terminal::disable_raw_mode() {
+            tracing::error!(?e, "Failed to disable raw mode");
+        }
     }
 }
 
@@ -1629,11 +1641,13 @@ pub async fn history(
         inline_height
     };
 
-    // Popup mode: if running under atuin-hex and inline mode is requested,
+    // Popup mode: if running under atuin pty-proxy and inline mode is requested,
     // fetch the screen state and render as a centered overlay.
     #[cfg(unix)]
     let (saved_screen, popup_rect, popup_scroll_offset) = {
-        let socket_path = std::env::var("ATUIN_HEX_SOCKET").ok();
+        let socket_path = std::env::var("ATUIN_PTY_PROXY_SOCKET")
+            .or_else(|_| std::env::var("ATUIN_HEX_SOCKET"))
+            .ok();
         if let Some(ref path) = socket_path
             && inline_height > 0
         {
