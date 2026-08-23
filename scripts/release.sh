@@ -451,8 +451,6 @@ publish_crates() {
         atuin-ai
         atuin-dotfiles
         atuin-history
-        atuin-nucleo/matcher
-        atuin-nucleo
         atuin-daemon
         atuin-kv
         atuin-scripts
@@ -460,7 +458,7 @@ publish_crates() {
         atuin-server-postgres
         atuin-server-sqlite
         atuin-server
-        atuin-hex
+        atuin-pty-proxy
         atuin
     )
 

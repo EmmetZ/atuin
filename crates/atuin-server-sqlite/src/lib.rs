@@ -1,20 +1,15 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use atuin_common::record::{EncryptedData, HostId, Record, RecordIdx, RecordStatus};
-use atuin_server_database::{
-    Database, DbError, DbResult, DbSettings,
-    models::{History, NewHistory, NewSession, NewUser, Session, User},
+use atuin_domain::record::{
+    EncryptedData, HostId, Record, RecordIdx, RecordSeriesKey, RecordStatus, RecordTag,
 };
-use futures_util::TryStreamExt;
-use sqlx::{
-    Row,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    types::Uuid,
-};
-use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+use atuin_server_database::models::{NewSession, NewUser, Session, User};
+use atuin_server_database::{Database, DbError, DbResult, DbSettings};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::types::Uuid;
 use tracing::instrument;
-use wrappers::{DbHistory, DbRecord, DbSession, DbUser};
+use wrappers::DbRecord;
 
 mod wrappers;
 
@@ -23,25 +18,14 @@ pub struct Sqlite {
     pool: sqlx::Pool<sqlx::sqlite::Sqlite>,
 }
 
-fn fix_error(error: sqlx::Error) -> DbError {
-    match error {
-        sqlx::Error::RowNotFound => DbError::NotFound,
-        error => DbError::Other(error.into()),
-    }
-}
-
 #[async_trait]
 impl Database for Sqlite {
     async fn new(settings: &DbSettings) -> DbResult<Self> {
-        let opts = SqliteConnectOptions::from_str(&settings.db_uri)
-            .map_err(fix_error)?
+        let opts = SqliteConnectOptions::from_str(&settings.db_uri)?
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true);
 
-        let pool = SqlitePoolOptions::new()
-            .connect_with(opts)
-            .await
-            .map_err(fix_error)?;
+        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
 
         sqlx::migrate!("./migrations")
             .run(&pool)
@@ -57,8 +41,7 @@ impl Database for Sqlite {
             .bind(token)
             .fetch_one(&self.pool)
             .await
-            .map_err(fix_error)
-            .map(|DbSession(session)| session)
+            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -72,8 +55,7 @@ impl Database for Sqlite {
         .bind(token)
         .fetch_one(&self.pool)
         .await
-        .map_err(fix_error)
-        .map(|DbUser(user)| user)
+        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -88,8 +70,7 @@ impl Database for Sqlite {
         .bind(session.user_id)
         .bind(token)
         .execute(&self.pool)
-        .await
-        .map_err(fix_error)?;
+        .await?;
 
         Ok(())
     }
@@ -100,8 +81,7 @@ impl Database for Sqlite {
             .bind(username)
             .fetch_one(&self.pool)
             .await
-            .map_err(fix_error)
-            .map(|DbUser(user)| user)
+            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -110,8 +90,7 @@ impl Database for Sqlite {
             .bind(u.id)
             .fetch_one(&self.pool)
             .await
-            .map_err(fix_error)
-            .map(|DbSession(session)| session)
+            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -130,8 +109,7 @@ impl Database for Sqlite {
         .bind(email)
         .bind(password)
         .fetch_one(&self.pool)
-        .await
-        .map_err(fix_error)?;
+        .await?;
 
         Ok(res.0)
     }
@@ -146,33 +124,9 @@ impl Database for Sqlite {
         .bind(&user.password)
         .bind(user.id)
         .execute(&self.pool)
-        .await
-        .map_err(fix_error)?;
+        .await?;
 
         Ok(())
-    }
-
-    #[instrument(skip_all)]
-    async fn count_history(&self, user: &User) -> DbResult<i64> {
-        // The cache is new, and the user might not yet have a cache value.
-        // They will have one as soon as they post up some new history, but handle that
-        // edge case.
-
-        let res: (i64,) = sqlx::query_as(
-            "select count(1) from history
-            where user_id = $1",
-        )
-        .bind(user.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(fix_error)?;
-
-        Ok(res.0)
-    }
-
-    #[instrument(skip_all)]
-    async fn count_history_cached(&self, _user: &User) -> DbResult<i64> {
-        Err(DbError::NotFound)
     }
 
     #[instrument(skip_all)]
@@ -180,61 +134,16 @@ impl Database for Sqlite {
         sqlx::query("delete from sessions where user_id = $1")
             .bind(u.id)
             .execute(&self.pool)
-            .await
-            .map_err(fix_error)?;
+            .await?;
 
-        sqlx::query("delete from users where id = $1")
-            .bind(u.id)
-            .execute(&self.pool)
-            .await
-            .map_err(fix_error)?;
+        sqlx::query("delete from users where id = $1").bind(u.id).execute(&self.pool).await?;
 
         sqlx::query("delete from history where user_id = $1")
             .bind(u.id)
             .execute(&self.pool)
-            .await
-            .map_err(fix_error)?;
+            .await?;
 
         Ok(())
-    }
-
-    async fn delete_history(&self, user: &User, id: String) -> DbResult<()> {
-        sqlx::query(
-            "update history
-            set deleted_at = $3
-            where user_id = $1
-            and client_id = $2
-            and deleted_at is null", // don't just keep setting it
-        )
-        .bind(user.id)
-        .bind(id)
-        .bind(time::OffsetDateTime::now_utc())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(fix_error)?;
-
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    async fn deleted_history(&self, user: &User) -> DbResult<Vec<String>> {
-        // The cache is new, and the user might not yet have a cache value.
-        // They will have one as soon as they post up some new history, but handle that
-        // edge case.
-
-        let res = sqlx::query(
-            "select client_id from history 
-            where user_id = $1
-            and deleted_at is not null",
-        )
-        .bind(user.id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(fix_error)?;
-
-        let res = res.iter().map(|row| row.get("client_id")).collect();
-
-        Ok(res)
     }
 
     async fn delete_store(&self, user: &User) -> DbResult<()> {
@@ -244,22 +153,21 @@ impl Database for Sqlite {
         )
         .bind(user.id)
         .execute(&self.pool)
-        .await
-        .map_err(fix_error)?;
+        .await?;
 
         Ok(())
     }
 
     #[instrument(skip_all)]
     async fn add_records(&self, user: &User, records: &[Record<EncryptedData>]) -> DbResult<()> {
-        let mut tx = self.pool.begin().await.map_err(fix_error)?;
+        let mut tx = self.pool.begin().await?;
 
         for i in records {
             let id = atuin_common::utils::uuid_v7();
 
             sqlx::query(
                 "insert into store
-                    (id, client_id, host, idx, timestamp, version, tag, data, cek, user_id) 
+                    (id, client_id, host, idx, timestamp, version, tag, data, cek, user_id)
                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 on conflict do nothing
                 ",
@@ -269,17 +177,16 @@ impl Database for Sqlite {
             .bind(i.host.id)
             .bind(i.idx as i64)
             .bind(i.timestamp as i64) // throwing away some data, but i64 is still big in terms of time
-            .bind(&i.version)
-            .bind(&i.tag)
-            .bind(&i.data.data)
-            .bind(&i.data.content_encryption_key)
+            .bind(i.version.as_str())
+            .bind(i.tag.as_str())
+            .bind(&i.data.raw)
+            .bind(&i.data.cek)
             .bind(user.id)
             .execute(&mut *tx)
-            .await
-            .map_err(fix_error)?;
+            .await?;
         }
 
-        tx.commit().await.map_err(fix_error)?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -288,12 +195,11 @@ impl Database for Sqlite {
     async fn next_records(
         &self,
         user: &User,
-        host: HostId,
-        tag: String,
+        series: &RecordSeriesKey,
         start: Option<RecordIdx>,
         count: u64,
     ) -> DbResult<Vec<Record<EncryptedData>>> {
-        tracing::debug!("{:?} - {:?} - {:?}", host, tag, start);
+        tracing::debug!("{:?} - {:?} - {:?}", series.host_id, series.tag, start);
         let start = start.unwrap_or(0);
 
         let records: Result<Vec<DbRecord>, DbError> = sqlx::query_as(
@@ -306,13 +212,13 @@ impl Database for Sqlite {
                     limit $5",
         )
         .bind(user.id)
-        .bind(tag.clone())
-        .bind(host)
+        .bind(series.tag.as_str())
+        .bind(series.host_id)
         .bind(start as i64)
         .bind(count as i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(fix_error);
+        .map_err(Into::into);
 
         let ret = match records {
             Ok(records) => {
@@ -327,7 +233,7 @@ impl Database for Sqlite {
                 records
             }
             Err(DbError::NotFound) => {
-                tracing::debug!("no records found in store: {:?}/{}", host, tag);
+                tracing::debug!("no records found in store: {:?}/{}", series.host_id, series.tag);
                 return Ok(vec![]);
             }
             Err(e) => return Err(e),
@@ -340,123 +246,15 @@ impl Database for Sqlite {
         const STATUS_SQL: &str =
             "select host, tag, max(idx) from store where user_id = $1 group by host, tag";
 
-        let res: Vec<(Uuid, String, i64)> = sqlx::query_as(STATUS_SQL)
-            .bind(user.id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(fix_error)?;
+        let res: Vec<(Uuid, String, i64)> =
+            sqlx::query_as(STATUS_SQL).bind(user.id).fetch_all(&self.pool).await?;
 
         let mut status = RecordStatus::new();
 
         for i in res {
-            status.set_raw(HostId(i.0), i.1, i.2 as u64);
+            status.set_raw(RecordSeriesKey::new(HostId(i.0), RecordTag::from(i.1)), i.2 as u64);
         }
 
         Ok(status)
     }
-
-    #[instrument(skip_all)]
-    async fn count_history_range(
-        &self,
-        user: &User,
-        range: std::ops::Range<time::OffsetDateTime>,
-    ) -> DbResult<i64> {
-        let res: (i64,) = sqlx::query_as(
-            "select count(1) from history
-            where user_id = $1
-            and timestamp >= $2::date
-            and timestamp < $3::date",
-        )
-        .bind(user.id)
-        .bind(into_utc(range.start))
-        .bind(into_utc(range.end))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(fix_error)?;
-
-        Ok(res.0)
-    }
-
-    #[instrument(skip_all)]
-    async fn list_history(
-        &self,
-        user: &User,
-        created_after: time::OffsetDateTime,
-        since: time::OffsetDateTime,
-        host: &str,
-        page_size: i64,
-    ) -> DbResult<Vec<History>> {
-        let res = sqlx::query_as(
-            "select id, client_id, user_id, hostname, timestamp, data, created_at from history
-            where user_id = $1
-            and hostname != $2
-            and created_at >= $3
-            and timestamp >= $4
-            order by timestamp asc
-            limit $5",
-        )
-        .bind(user.id)
-        .bind(host)
-        .bind(into_utc(created_after))
-        .bind(into_utc(since))
-        .bind(page_size)
-        .fetch(&self.pool)
-        .map_ok(|DbHistory(h)| h)
-        .try_collect()
-        .await
-        .map_err(fix_error)?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip_all)]
-    async fn add_history(&self, history: &[NewHistory]) -> DbResult<()> {
-        let mut tx = self.pool.begin().await.map_err(fix_error)?;
-
-        for i in history {
-            let client_id: &str = &i.client_id;
-            let hostname: &str = &i.hostname;
-            let data: &str = &i.data;
-
-            sqlx::query(
-                "insert into history
-                    (client_id, user_id, hostname, timestamp, data) 
-                values ($1, $2, $3, $4, $5)
-                on conflict do nothing
-                ",
-            )
-            .bind(client_id)
-            .bind(i.user_id)
-            .bind(hostname)
-            .bind(i.timestamp)
-            .bind(data)
-            .execute(&mut *tx)
-            .await
-            .map_err(fix_error)?;
-        }
-
-        tx.commit().await.map_err(fix_error)?;
-
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    async fn oldest_history(&self, user: &User) -> DbResult<History> {
-        sqlx::query_as(
-            "select id, client_id, user_id, hostname, timestamp, data, created_at from history 
-            where user_id = $1
-            order by timestamp asc
-            limit 1",
-        )
-        .bind(user.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(fix_error)
-        .map(|DbHistory(h)| h)
-    }
-}
-
-fn into_utc(x: OffsetDateTime) -> PrimitiveDateTime {
-    let x = x.to_offset(UtcOffset::UTC);
-    PrimitiveDateTime::new(x.date(), x.time())
 }

@@ -1,4 +1,5 @@
-use std::{env, fs, path::PathBuf};
+use std::path::PathBuf;
+use std::{env, fs};
 
 use protox::prost::Message;
 
@@ -7,6 +8,7 @@ fn main() -> std::io::Result<()> {
         "proto/history.proto",
         "proto/search.proto",
         "proto/control.proto",
+        "proto/semantic.proto",
     ];
     let proto_include_dirs = ["proto"];
 

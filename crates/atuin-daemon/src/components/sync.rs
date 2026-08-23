@@ -2,20 +2,23 @@
 //!
 //! Handles periodic synchronization with the Atuin cloud server.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use atuin_client::history::HistoryId;
+use atuin_client::history::store::HistoryStore;
+use atuin_client::record::sync::{ClientSource, SyncEngine};
+use atuin_client::settings::Settings;
+use atuin_dotfiles::store::AliasStore;
+use atuin_dotfiles::store::var::VarStore;
 use eyre::Result;
+use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
-use atuin_client::{history::store::HistoryStore, record::sync, settings::Settings};
-use atuin_dotfiles::store::{AliasStore, var::VarStore};
-
-use crate::{
-    daemon::{Component, DaemonHandle},
-    events::DaemonEvent,
-};
+use crate::daemon::{Component, DaemonHandle};
+use crate::events::DaemonEvent;
 
 /// Commands that can be sent to the sync task.
 enum SyncCommand {
@@ -63,7 +66,6 @@ impl Default for SyncComponent {
     }
 }
 
-#[tonic::async_trait]
 impl Component for SyncComponent {
     fn name(&self) -> &'static str {
         "sync"
@@ -121,10 +123,10 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
     };
 
     // Create the stores we need
-    let encryption_key = *handle.encryption_key();
-    let history_store = HistoryStore::new(handle.store().clone(), host_id, encryption_key);
-    let alias_store = AliasStore::new(handle.store().clone(), host_id, encryption_key);
-    let var_store = VarStore::new(handle.store().clone(), host_id, encryption_key);
+    let encryption_key = handle.encryption_key();
+    let history_store = HistoryStore::new(handle.store().clone(), host_id, encryption_key.clone());
+    let alias_store = AliasStore::new(handle.store().clone(), host_id, encryption_key.clone());
+    let var_store = VarStore::new(handle.store().clone(), host_id, encryption_key.clone());
 
     // Don't backoff by more than 30 mins (with a random jitter of up to 1 min)
     let max_interval: f64 = 60.0 * 30.0 + rand::thread_rng().gen_range(0.0..60.0);
@@ -145,6 +147,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
                 // Skip periodic ticks if auto_sync is disabled AND we're not retrying
                 // a previous failure. Retries must continue regardless of auto_sync.
                 if !settings.auto_sync && sync_state == SyncState::Idle {
+                    drop(settings);
                     tracing::debug!("auto_sync disabled, skipping periodic sync tick");
                     continue;
                 }
@@ -213,7 +216,19 @@ async fn do_sync_tick(
     }
 
     // Perform the sync
-    let res = sync::sync(settings, handle.store()).await;
+    let res = async {
+        let engine = SyncEngine::builder()
+            .store(handle.store().clone())
+            .client_source(ClientSource::FromSettings {
+                settings,
+                caps: Some(handle.caps().clone()),
+            })
+            .build()
+            .connect()
+            .await?;
+        engine.keyed(handle.encryption_key()).sync().await
+    }
+    .await;
 
     match res {
         Err(e) => {
@@ -250,16 +265,27 @@ async fn do_sync_tick(
                 "sync complete"
             );
 
-            // Build history from downloaded records
-            if let Err(e) = history_store
-                .incremental_build(handle.history_db(), &downloaded_records)
-                .await
-            {
-                tracing::error!("failed to build history from downloaded records: {e}");
-            }
+            // `incremental_build` already yields in bounded batches - an initial sync (on
+            // backfill, eg.) risks being dozens of GB of RAM otherwise.
+            let batches = history_store.incremental_build(handle.history_db(), &downloaded_records);
+            futures::pin_mut!(batches);
 
-            // Emit the records added event (for search indexing)
-            handle.emit(DaemonEvent::RecordsAdded(downloaded_records.clone()));
+            while let Some(batch) = batches.next().await {
+                match batch {
+                    Ok(histories) if !histories.is_empty() => {
+                        // Only the IDs go on the bus; the rows themselves are already in sqlite.
+                        let ids: Arc<[HistoryId]> =
+                            histories.iter().map(|h| h.id.clone()).collect();
+                        handle.emit(DaemonEvent::HistorySynced(ids));
+                    }
+                    Ok(_) => {}
+                    // Legacy behavior was to abort on the first error.
+                    Err(e) => {
+                        tracing::error!("failed to build history from downloaded records: {e}");
+                        break;
+                    }
+                }
+            }
 
             // Emit sync completed event
             handle.emit(DaemonEvent::SyncCompleted {

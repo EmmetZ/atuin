@@ -1,10 +1,12 @@
 use std::io::{self, IsTerminal, Read};
 
+use atuin_client::record::sqlite_store::SqliteStore;
+use atuin_client::settings::Settings;
+use atuin_common::encryption::paseto_v4;
+use atuin_kv::store::KvStore;
 use clap::Subcommand;
 use eyre::{Context, Result, eyre};
-
-use atuin_client::{encryption, record::sqlite_store::SqliteStore, settings::Settings};
-use atuin_kv::store::KvStore;
+use tracing::instrument;
 
 #[derive(Subcommand, Debug)]
 #[command(infer_subcommands = true)]
@@ -62,10 +64,10 @@ pub enum Cmd {
 }
 
 impl Cmd {
+    #[instrument(level = "trace", skip_all, err)]
     pub async fn run(&self, settings: &Settings, store: &SqliteStore) -> Result<()> {
-        let encryption_key: [u8; 32] = encryption::load_key(settings)
-            .context("could not load encryption key")?
-            .into();
+        let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
+            .context("could not load encryption key")?;
 
         let host_id = Settings::host_id().await?;
 
@@ -91,9 +93,7 @@ impl Cmd {
                         .context("failed to read value from stdin")?;
                     buf
                 } else {
-                    return Err(eyre!(
-                        "no value provided. Pass as an argument or pipe via stdin"
-                    ));
+                    return Err(eyre!("no value provided. Pass as an argument or pipe via stdin"));
                 };
 
                 kv_store.set(namespace, key, &value).await

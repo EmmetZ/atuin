@@ -4,12 +4,16 @@
 use clap::Parser;
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
+use command::AtuinCmd;
 use eyre::Result;
 
-use command::AtuinCmd;
-
 mod command;
+pub(crate) mod logs;
+#[cfg(feature = "client")]
+pub(crate) mod shell;
 
+#[cfg(feature = "sync")]
+mod print_error;
 #[cfg(feature = "sync")]
 mod sync;
 

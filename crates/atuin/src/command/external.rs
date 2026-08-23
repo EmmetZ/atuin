@@ -3,7 +3,7 @@ use std::process::Command;
 use std::{io, process};
 
 #[cfg(feature = "client")]
-use atuin_client::plugin::OfficialPluginRegistry;
+use atuin_client::plugin::{OfficialPluginRegistry, PluginContext};
 use clap::CommandFactory;
 use clap::builder::{StyledStr, Styles};
 use eyre::Result;
@@ -15,6 +15,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let bin = format!("atuin-{subcommand}");
     let mut cmd = Command::new(&bin);
     cmd.args(&args[1..]);
+
+    #[cfg(feature = "client")]
+    let context = PluginContext::new(subcommand);
 
     let spawn_result = match cmd.spawn() {
         Ok(child) => Ok(child),
@@ -33,11 +36,18 @@ pub fn run(args: &[String]) -> Result<()> {
             if status.success() {
                 Ok(())
             } else {
+                #[cfg(feature = "client")]
+                drop(context);
+
                 process::exit(status.code().unwrap_or(1));
             }
         }
         Err(e) => {
             eprintln!("{}", e.ansi());
+
+            #[cfg(feature = "client")]
+            drop(context);
+
             process::exit(1);
         }
     }
@@ -60,7 +70,8 @@ fn render_not_found(subcommand: &str, bin: &str) -> StyledStr {
             let _ = write!(output, "{error}error:{error:#} ");
             let _ = write!(
                 output,
-                "'{invalid}{subcommand}{invalid:#}' is an official atuin plugin, but it's not installed"
+                "'{invalid}{subcommand}{invalid:#}' is an official atuin plugin, but it's not \
+                 installed"
             );
             let _ = write!(output, "\n\n");
             let _ = write!(output, "{install_message}");
@@ -72,21 +83,13 @@ fn render_not_found(subcommand: &str, bin: &str) -> StyledStr {
     let usage = atuin_cmd.render_usage();
 
     let _ = write!(output, "{error}error:{error:#} ");
-    let _ = write!(
-        output,
-        "unrecognized subcommand '{invalid}{subcommand}{invalid:#}' "
-    );
-    let _ = write!(
-        output,
-        "and no executable named '{invalid}{bin}{invalid:#}' found in your PATH"
-    );
+    let _ = write!(output, "unrecognized subcommand '{invalid}{subcommand}{invalid:#}' ");
+    let _ =
+        write!(output, "and no executable named '{invalid}{bin}{invalid:#}' found in your PATH");
     let _ = write!(output, "\n\n");
     let _ = write!(output, "{usage}");
     let _ = write!(output, "\n\n");
-    let _ = write!(
-        output,
-        "For more information, try '{literal}--help{literal:#}'."
-    );
+    let _ = write!(output, "For more information, try '{literal}--help{literal:#}'.");
 
     output
 }

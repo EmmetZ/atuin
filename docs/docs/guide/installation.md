@@ -17,7 +17,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh
 ```
 
 The install script will walk you through importing your shell history and setting
-up a sync account. To skip these interactive prompts (e.g. in CI or
+up a sync account. To skip these interactive prompts (for example, in CI or
 Dockerfiles), pass `--non-interactive`:
 
 ```shell
@@ -52,11 +52,15 @@ If you don't wish to use the installer, the manual installation steps are as fol
 
 === "Cargo"
 
-    It's best to use [rustup](https://rustup.rs/) to set up a Rust
+    Atuin requires a recent Rust toolchain. The minimum supported version is
+    set by `rust-version` in the workspace
+    [`Cargo.toml`](https://github.com/atuinsh/atuin/blob/main/Cargo.toml)
+    (currently {{ msrv }}). Distribution package managers often ship an older Rust,
+    so it's best to use [rustup](https://rustup.rs/) to set up an up-to-date
     toolchain, then you can run:
 
     ```shell
-    cargo install atuin
+    cargo install atuin --locked
     ```
 
 === "Homebrew"
@@ -144,18 +148,21 @@ If you don't wish to use the installer, the manual installation steps are as fol
 === "Source"
 
     Atuin builds on the latest stable version of Rust, and we make no
-    promises regarding older versions. We recommend using [rustup](https://rustup.rs/).
+    promises regarding older versions. The minimum supported version is set by
+    `rust-version` in the workspace
+    [`Cargo.toml`](https://github.com/atuinsh/atuin/blob/main/Cargo.toml)
+    (currently {{ msrv }}). We recommend using [rustup](https://rustup.rs/).
 
     ```shell
     git clone https://github.com/atuinsh/atuin.git
-    cd atuin/crates/atuin
-    cargo install --path .
+    cd atuin
+    cargo install --path crates/atuin --locked
     ```
 
 !!! warning "Please be advised"
 
     If you choose to manually install Atuin rather than using the recommended installation script,
-    merely installing the binary is not sufficient, you should also set up the shell plugin.
+    merely installing the binary isn't sufficient, you should also set up the shell plugin.
 
 ---
 
@@ -204,32 +211,41 @@ After installing, remember to restart your shell.
 
     === "bash-preexec"
 
-        [Bash-preexec](https://github.com/rcaloras/bash-preexec) can also be used, but you may experience
+        [bash-preexec](https://github.com/rcaloras/bash-preexec) can also be used, but you may experience
          some minor problems with the recorded duration and exit status of some commands.
 
         !!! warning "Please note"
 
-            bash-preexec currently has an issue where it will stop honoring `ignorespace`.
-            While Atuin will ignore commands prefixed with whitespace, they may still end up in your bash history.
-            Please check your configuration! All other shells do not have this issue.
+            bash-preexec currently has [an issue][bp-ignorespace] where it will stop
+            honoring `ignorespace`. While Atuin will ignore commands prefixed with
+            whitespace, they may still end up in your bash history. Please check your
+            configuration! All other shells don't have this issue.
 
             To use `atuin < 18.10.0` in `bash < 4` with bash-preexec, the option
             `enter_accept` needs to be turned on (which is so by default).  There is no
             restriction in the latest version of Atuin (>= 18.10.0).
 
-            bash-preexec cannot properly invoke the `preexec` hook for subshell commands
+            bash-preexec can't properly invoke the `preexec` hook for subshell commands
             `(...)`, function definitions `func() { ...; }`, empty for-in-statements `for
             i in; do ...; done`, etc., so those commands and duration may not be recorded
             in the Atuin's history correctly.
 
-        To use bash-preexec, download and initialize it
+        As of Atuin 18.18.0, `atuin init bash` will automatically load bash-preexec if no other
+        preexec backend has been loaded (ble.sh or an external copy of bash-preexec). To disable
+        this behavior, pass `ATUIN_NO_BUILTIN_PREEXEC=1` to `atuin init`, e.g.:
+
+        ```shell
+        eval "$(ATUIN_NO_BUILTIN_PREEXEC=1 atuin init bash)"
+        ```
+
+        If you prefer, you can also download and install bash-preexec separately:
 
         ```shell
         curl https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh -o ~/.bash-preexec.sh
         echo '[[ -f ~/.bash-preexec.sh ]] && source ~/.bash-preexec.sh' >> ~/.bashrc
         ```
 
-        Then set up Atuin
+        Then set up Atuin:
 
         ```shell
         echo 'eval "$(atuin init bash)"' >> ~/.bashrc
@@ -260,21 +276,21 @@ After installing, remember to restart your shell.
     source ~/.local/share/atuin/init.nu
     ```
 
-    ??? tip "Optional: Atuin Hex"
-        Hex is a lightweight pty proxy that renders the Atuin popup over
+    ??? tip "Optional: Atuin pty-proxy"
+        pty-proxy is a lightweight pty proxy that renders the Atuin popup over
         your previous output, restoring it when closed — no clearing, no
-        fullscreen. To use Hex with Nushell, generate the init script:
+        fullscreen. To use pty-proxy with Nushell, generate the init script:
 
         ```shell
         mkdir ~/.local/share/atuin/
-        atuin hex init nu | save -f ~/.local/share/atuin/hex-init.nu
+        atuin pty-proxy init nu | save -f ~/.local/share/atuin/pty-proxy-init.nu
         ```
 
         Then source it as early as possible in your `config.nu`, *before*
         the regular atuin init:
 
         ```shell
-        source ~/.local/share/atuin/hex-init.nu
+        source ~/.local/share/atuin/pty-proxy-init.nu
         source ~/.local/share/atuin/init.nu
         ```
 
@@ -299,10 +315,12 @@ After installing, remember to restart your shell.
 
 ## Upgrade
 
-Run `atuin update`, and if that command is not available, run the install script again.
+Run `atuin update`, and if that command isn't available, run the install script again.
 
 If you used a package manager to install Atuin, then you should also use your package manager to update Atuin.
 
 ## Uninstall
 
 If you'd like to uninstall Atuin, please check out [the uninstall page](../uninstall.md).
+
+[bp-ignorespace]: https://github.com/rcaloras/bash-preexec/issues/115

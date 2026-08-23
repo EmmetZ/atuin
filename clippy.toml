@@ -1,0 +1,63 @@
+[[disallowed-methods]]
+path = "std::time::Duration::new"
+reason = """panics on overflow; use atuin_common::time::DurationExt::try_new, or \
+    Duration::from_secs when nanos are 0"""
+
+[[disallowed-methods]]
+path = "time::Duration::new"
+reason = "panics on overflow; use atuin_common::time::DurationExt::try_new"
+
+[[disallowed-methods]]
+path = "std::time::Duration::from_secs_f64"
+reason = "panics on NaN/negative/overflow; use Duration::try_from_secs_f64"
+
+# https://github.com/time-rs/time/issues/802
+[[disallowed-methods]]
+path = "time::OffsetDateTime::from_unix_timestamp_nanos"
+reason = """wraps out-of-range input to a valid-looking wrong date (time-rs/time#802); use \
+    atuin_common::time::OffsetDateTimeExt::from_unix_nanos"""
+
+[[disallowed-methods]]
+path = "time::UtcDateTime::from_unix_timestamp_nanos"
+reason = """same truncation bug as OffsetDateTime (time-rs/time#802); range-check the full i128 \
+    before converting"""
+
+[[disallowed-methods]]
+path = "vt100::Parser::new"
+reason = "can panic; `use atuin_common::ansi::Vt100ParserExt as _` and use `Parser::new_safe`"
+
+[[disallowed-methods]]
+path = "vt100::Screen::set_size"
+reason = "can panic; `use atuin_common::ansi::Vt100ScreenExt as _` and use `Screen::set_size_safe`"
+
+[[disallowed-types]]
+path = "std::sync::Mutex"
+reason = "use parking_lot::Mutex which is faster"
+
+[[disallowed-types]]
+path = "std::sync::MutexGuard"
+reason = "use parking_lot::MutexGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLock"
+reason = "use parking_lot::RwLock which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLockReadGuard"
+reason = "use parking_lot::RwLockReadGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLockWriteGuard"
+reason = "use parking_lot::RwLockWriteGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::Condvar"
+reason = "use parking_lot::Condvar which is faster"
+
+[[disallowed-types]]
+path = "std::sync::Once"
+reason = "use parking_lot::Once which is faster"
+
+[[disallowed-types]]
+path = "std::sync::ReentrantLock"
+reason = "use parking_lot::ReentrantMutex which is faster"

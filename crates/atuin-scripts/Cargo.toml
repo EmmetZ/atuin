@@ -14,8 +14,10 @@ readme.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-atuin-client = { path = "../atuin-client", version = "18.16.0" }
-atuin-common = { path = "../atuin-common", version = "18.16.0" }
+atuin-client = { path = "../atuin-client", version = "18.20.0-beta.3" }
+atuin-common = { path = "../atuin-common", version = "18.20.0-beta.3" }
+atuin-domain = { path = "../atuin-domain", version = "18.20.0-beta.3" }
+derive_more = { workspace = true }
 
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -32,3 +34,8 @@ tempfile = { workspace = true }
 minijinja = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+rstest = { workspace = true }
+
+[lints]
+workspace = true
