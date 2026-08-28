@@ -12,7 +12,7 @@ use ratatui::backend::FromCrossterm;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::style;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 use time::{OffsetDateTime, UtcOffset};
 
@@ -297,15 +297,7 @@ impl DrawState<'_> {
     }
 
     fn command(&mut self, h: &History, _width: u16) {
-        let mut style = self.theme.as_style(Meaning::Base);
-        let mut row_highlighted = false;
-        if !self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
-        {
-            row_highlighted = true;
-            // if not applying alternative highlighting to the whole row, color the command
-            style = self.theme.as_style(Meaning::AlertError);
-            style.attributes.set(style::Attribute::Bold);
-        }
+        let style = self.theme.as_style(Meaning::Base);
 
         // Build the normalized command string (whitespace-collapsed, control chars escaped)
         let normalized: String =
@@ -313,8 +305,9 @@ impl DrawState<'_> {
 
         let highlight_indices = self.history_highlighter.get_highlight_indices(&normalized);
 
-        // The selected row keeps its single highlight color.
-        let syntax = if self.syntax_highlight && !row_highlighted {
+        // Selection is shown with a background highlight, so syntax colors
+        // stay on for the selected row as well.
+        let syntax = if self.syntax_highlight {
             syntax::classify(&normalized, h.shell.as_deref())
         } else {
             Vec::new()
@@ -343,9 +336,9 @@ impl DrawState<'_> {
                 .and_then(|b| syntax.get(b))
                 .map_or(style, |&meaning| self.theme.as_style(meaning));
             if highlighted {
-                if row_highlighted {
-                    char_style = self.theme.as_style(Meaning::AlertWarn);
-                }
+                // Matches get a distinct color on every row, so they stand out
+                // clearly, including on the background-highlighted selected row.
+                char_style = self.theme.as_style(Meaning::Important);
                 char_style.attributes.set(style::Attribute::Bold);
             }
             self.draw(&ch.to_string(), Style::from_crossterm(char_style));
@@ -425,9 +418,14 @@ impl DrawState<'_> {
             self.list_area.bottom() - self.y - 1
         };
 
-        if self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
-        {
-            style = style.add_modifier(Modifier::REVERSED);
+        if self.y as usize + self.state.offset == self.state.selected {
+            if self.alternate_highlight {
+                style = style.add_modifier(Modifier::REVERSED);
+            } else {
+                // Mark the selected row with a background highlight instead of
+                // recoloring its foreground, keeping the text itself readable.
+                style = style.bg(Color::from_crossterm(self.theme.get_background_color()));
+            }
         }
 
         let w = (self.list_area.width - self.x) as usize;

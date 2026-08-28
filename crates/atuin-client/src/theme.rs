@@ -31,6 +31,7 @@ pub enum Meaning {
     Important,
     Title,
     Muted,
+    BaseBg,
     SyntaxCommand,
     SyntaxFlag,
     SyntaxString,
@@ -119,6 +120,13 @@ impl Theme {
     // General access - if you have a meaning, this will give you a (crossterm) style
     pub fn as_style(&self, meaning: Meaning) -> ContentStyle {
         self.styles[self.closest_meaning(&meaning)]
+    }
+
+    // The color used to paint the background of the selected row. It is stored
+    // as the foreground color of the `BaseBg` meaning, so it can be set from a
+    // theme file just like any other color.
+    pub fn get_background_color(&self) -> Color {
+        self.as_style(Meaning::BaseBg).foreground_color.unwrap_or(Color::DarkGrey)
     }
 
     // Turns a map of meanings to colornames into a theme
@@ -286,6 +294,10 @@ static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(|| {
             ),
             (Meaning::Muted, StyleFactory::from_fg_color(Color::Grey)),
             (Meaning::Base, ContentStyle::default()),
+            (
+                Meaning::BaseBg,
+                StyleFactory::from_fg_color(Color::DarkGrey),
+            ),
             // Syntax highlighting uses ANSI palette colors, so they follow
             // the user's terminal color scheme out of the box.
             (Meaning::SyntaxCommand, StyleFactory::from_fg_color(Color::Green)),
