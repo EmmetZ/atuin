@@ -128,7 +128,7 @@ impl CommandData {
             return None;
         };
 
-        let history_id = parse_uuid_bytes(&history.id.0)?;
+        let history_id = history.id.into_bytes();
         let session = parse_uuid_bytes(&history.session)?;
         let timestamp = history.timestamp.unix_timestamp();
 
@@ -153,9 +153,7 @@ impl CommandData {
     /// Add an invocation from a history entry.
     /// Returns false if the history entry has invalid UUIDs.
     pub fn add_invocation(&mut self, history: &History, interner: &ThreadedRodeo) -> bool {
-        let Some(history_id) = parse_uuid_bytes(&history.id.0) else {
-            return false;
-        };
+        let history_id = history.id.into_bytes();
         let Some(session) = parse_uuid_bytes(&history.session) else {
             return false;
         };
@@ -355,6 +353,7 @@ pub struct SearchIndex {
 
 impl SearchIndex {
     /// Create a new empty search index.
+    #[must_use]
     pub fn new(shells: OrFilter<Vec<String>>) -> Self {
         Self {
             commands: Arc::new(DashMap::new()),
@@ -587,7 +586,7 @@ mod tests {
 
     #[test]
     fn frecency_data_compute() {
-        let now = 1000000i64;
+        let now = 1_000_000_i64;
 
         // Recent command (with default multipliers of 1.0)
         let recent = FrecencyData {
@@ -614,7 +613,7 @@ mod tests {
 
     #[test]
     fn frecency_data_compute_with_multipliers() {
-        let now = 1000000i64;
+        let now = 1_000_000_i64;
 
         let data = FrecencyData {
             count: 5,

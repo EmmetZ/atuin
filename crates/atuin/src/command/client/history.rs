@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use atuin_client::database::{Sqlite, current_context};
 use atuin_client::history::store::HistoryStore;
-use atuin_client::history::{AuthorKind, History, probe_author};
+use atuin_client::history::{AuthorKind, History, HistoryId, probe_author};
 #[cfg(feature = "sync")]
 use atuin_client::record;
 use atuin_client::record::sqlite_store::SqliteStore;
@@ -68,7 +68,7 @@ pub enum Cmd {
 
     /// Finishes a new command in the history (adds time, exit code)
     End {
-        id: String,
+        id: HistoryId,
         #[arg(long, short)]
         exit: i64,
         #[arg(long, short)]
@@ -345,7 +345,7 @@ impl FormatKey for FmtHistory<'_> {
             "intent" => f.write_str(self.history.intent.as_deref().unwrap_or_default())?,
             "user" => f.write_str(self.history.cmd_origin.user().into_inner())?,
             "session" => f.write_str(&self.history.session)?,
-            "uuid" => f.write_str(&self.history.id.0)?,
+            "uuid" => write!(f, "{}", self.history.id)?,
             _ => return Err(FormatKeyError::UnknownKey),
         }
         Ok(())
@@ -444,7 +444,7 @@ async fn handle_start(
     author: Option<&str>,
     author_kind: Option<AuthorKind>,
     intent: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<HistoryId>> {
     let Some(h) = make_starting_history(settings, command, author, author_kind, intent) else {
         return Ok(None);
     };
@@ -455,7 +455,7 @@ async fn handle_start(
         debug!("failed to save history: {e}");
     }
 
-    Ok(Some(h.id.0.clone()))
+    Ok(Some(h.id))
 }
 
 #[cfg(feature = "daemon")]
@@ -466,12 +466,12 @@ async fn handle_daemon_start(
     author: Option<&str>,
     author_kind: Option<AuthorKind>,
     intent: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<HistoryId>> {
     let Some(h) = make_starting_history(settings, command, author, author_kind, intent) else {
         return Ok(None);
     };
 
-    let local_id = h.id.0.clone();
+    let local_id = h.id;
 
     // Attempt to start history via daemon, but silently ignore errors
     // to avoid breaking the shell when the daemon is unavailable or disk is full
@@ -493,14 +493,10 @@ async fn handle_end(
     store: SqliteStore,
     history_store: HistoryStore,
     settings: &Settings,
-    id: &str,
+    id: HistoryId,
     exit: i64,
     duration: Option<u64>,
 ) -> Result<()> {
-    if id.trim() == "" {
-        return Ok(());
-    }
-
     let Some(mut h) = db.load(id).await? else {
         warn!("history entry is missing");
         return Ok(());
@@ -535,15 +531,11 @@ async fn handle_end(
     if settings.should_sync().await? {
         #[cfg(feature = "sync")]
         {
-            let caps = atuin_client::api_client::caps_client(
-                &settings.sync_address,
-                &settings.extra_headers,
-            )?;
             let engine = record::sync::SyncEngine::builder()
                 .store(store.clone())
                 .client_source(record::sync::ClientSource::FromSettings {
                     settings,
-                    caps: Some(caps),
+                    caps: None,
                 })
                 .build()
                 .connect()
@@ -566,7 +558,7 @@ async fn handle_end(
 #[instrument(level = "trace", skip_all, fields(id = %id, exit, duration = ?duration), err)]
 async fn handle_daemon_end(
     settings: &Settings,
-    id: &str,
+    id: HistoryId,
     exit: i64,
     duration: Option<u64>,
 ) -> Result<()> {
@@ -587,21 +579,21 @@ pub(super) async fn start_history_entry(
     author: Option<&str>,
     author_kind: Option<AuthorKind>,
     intent: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<Option<HistoryId>> {
     #[cfg(feature = "daemon")]
     if settings.daemon.enabled {
         return handle_daemon_start(settings, command, author, author_kind, intent).await;
     }
 
     let db_path = &settings.db_path;
-    let db = Sqlite::new(db_path, settings.local_timeout).await?;
+    let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?).await?;
     handle_start(&db, settings, command, author, author_kind, intent).await
 }
 
 #[instrument(level = "trace", skip_all, fields(id = %id, exit, duration = ?duration), err)]
 pub(super) async fn end_history_entry(
     settings: &Settings,
-    id: &str,
+    id: HistoryId,
     exit: i64,
     duration: Option<u64>,
 ) -> Result<()> {
@@ -613,11 +605,13 @@ pub(super) async fn end_history_entry(
     let db_path = &settings.db_path;
     let record_store_path = &settings.record_store_path;
 
-    let db = Sqlite::new(db_path, settings.local_timeout).await?;
-    let store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
+    let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?).await?;
+    let store =
+        SqliteStore::new(record_store_path, Duration::try_from_secs_f64(settings.local_timeout)?)
+            .await?;
 
-    let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
-        .context("could not load encryption key")?;
+    let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
+        .context("could not load or generate encryption key")?;
     let host_id = Settings::host_id().await?;
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
@@ -648,7 +642,7 @@ struct TailJsonEvent<'a> {
 #[cfg(feature = "daemon")]
 #[derive(Serialize)]
 struct TailJsonHistory<'a> {
-    id: &'a str,
+    id: HistoryId,
     timestamp: String,
     timestamp_unix_ns: u64,
     command: &'a str,
@@ -691,7 +685,7 @@ impl TailEvent {
         Ok(Self {
             kind,
             history: History {
-                id: history.id.into(),
+                id: history.id.parse()?,
                 timestamp,
                 duration: history.duration,
                 exit: history.exit,
@@ -723,7 +717,7 @@ impl TailEvent {
         let payload = TailJsonEvent {
             event: self.kind.as_str(),
             history: TailJsonHistory {
-                id: &self.history.id.0,
+                id: self.history.id,
                 timestamp: self.history.timestamp.to_offset(tz.0).display().ymd_hms().to_string(),
                 timestamp_unix_ns: u64::try_from(self.history.timestamp.unix_timestamp_nanos())
                     .context("history timestamp predates unix epoch")?,
@@ -783,7 +777,7 @@ impl TailEvent {
             "start",
             &self.history.timestamp.to_offset(tz.0).display().ymd_hms().to_string(),
         );
-        push_pretty_field(&mut out, "history", &self.history.id.0);
+        push_pretty_field(&mut out, "history", &self.history.id.to_string());
         push_pretty_field(&mut out, "session", &self.history.session);
         push_pretty_field(&mut out, "exit", &self.exit_display());
         push_pretty_field(&mut out, "duration", &self.duration_display());
@@ -997,14 +991,14 @@ impl Cmd {
                 settings.timezone,
             );
         } else {
-            let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
-                .context("could not load encryption key")?;
+            let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
+                .context("could not load or generate encryption key")?;
             let host_id = Settings::host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in matches {
                 eprintln!("deleting {}", entry.id);
-                let (id, _) = history_store.delete(entry.id.clone()).await?;
+                let (id, _) = history_store.delete(entry.id).await?;
                 history_store.build_all(db, &[id]).await?;
             }
 
@@ -1052,13 +1046,13 @@ impl Cmd {
                 settings.timezone,
             );
         } else {
-            let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
-                .context("could not load encryption key")?;
+            let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
+                .context("could not load or generate encryption key")?;
             let host_id = Settings::host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             #[cfg(feature = "daemon")]
-            let ids = matches.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+            let ids = matches.iter().map(|h| h.id).collect::<Vec<_>>();
 
             for entry in matches {
                 eprintln!("deleting {}", entry.id);
@@ -1107,7 +1101,7 @@ impl Cmd {
             }
             Self::End {
                 id, exit, duration, ..
-            } => end_history_entry(settings, &id, exit, duration).await,
+            } => end_history_entry(settings, id, exit, duration).await,
             Self::Tail => {
                 #[cfg(feature = "daemon")]
                 {
@@ -1123,11 +1117,16 @@ impl Cmd {
                 let db_path = &settings.db_path;
                 let record_store_path = &settings.record_store_path;
 
-                let db = Sqlite::new(db_path, settings.local_timeout).await?;
-                let store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
+                let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?)
+                    .await?;
+                let store = SqliteStore::new(
+                    record_store_path,
+                    Duration::try_from_secs_f64(settings.local_timeout)?,
+                )
+                .await?;
 
-                let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
-                    .context("could not load encryption key")?;
+                let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
+                    .context("could not load or generate encryption key")?;
 
                 let host_id = Settings::host_id().await?;
                 let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
@@ -1227,7 +1226,7 @@ mod tests {
 
     #[fixture]
     async fn db() -> Sqlite {
-        Sqlite::new("sqlite::memory:", 2.0).await.unwrap()
+        Sqlite::in_memory(Duration::from_secs(2)).await.unwrap()
     }
 
     #[fixture]
@@ -1304,7 +1303,7 @@ mod tests {
         TailEvent {
             kind,
             history: History {
-                id: "history-id".to_owned().into(),
+                id: "018f011c-9a0a-7000-8000-000000000001".parse().unwrap(),
                 timestamp: datetime!(2026-04-09 17:18:19 UTC),
                 duration: 12_345_678,
                 exit: 0,
@@ -1328,7 +1327,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(value["event"], "ended");
-        assert_eq!(value["history"]["id"], "history-id");
+        assert_eq!(value["history"]["id"], "018f011c9a0a70008000000000000001");
         assert_eq!(value["history"]["duration_ns"], 12_345_678);
         assert_eq!(value["history"]["success"], true);
         assert!(value.get("record").is_none());

@@ -8,7 +8,9 @@ use atuin_common::time::OffsetDateTimeExt;
 use atuin_common::utils::{normalize_optional_string, uuid_v7};
 use atuin_domain::record::{CmdOrigin, DecryptedData, UNKNOWN_USER};
 use eyre::{Result, bail};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::secrets::SECRET_PATTERNS_RE;
 use crate::settings::Settings;
@@ -27,6 +29,7 @@ pub const AUTHOR_FILTER_ALL_USER: &str = "$all-user";
 /// The spelling of [`AuthorPattern::AllAgent`] on the command line and in the MCP tool schema.
 pub const AUTHOR_FILTER_ALL_AGENT: &str = "$all-agent";
 
+#[must_use]
 pub fn is_known_agent(author: &str) -> bool {
     KNOWN_AGENTS.contains(&author)
 }
@@ -52,11 +55,13 @@ impl AuthorKind {
     /// so it stays in lockstep with [`Self::from_repr`] (a test pins the two together).
     pub const VARIANTS: [Self; 2] = [Self::User, Self::Agent];
 
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
     /// The kind stated by the invoking integration's environment (`ATUIN_HISTORY_AUTHOR_KIND`).
+    #[must_use]
     pub fn probe_current() -> Option<Self> {
         let value = env::var(HISTORY_AUTHOR_KIND_ENV).ok()?;
         clap::ValueEnum::from_str(&value, true).ok()
@@ -112,6 +117,7 @@ const HISTORY_AUTHOR_KIND_ENV: &str = "ATUIN_HISTORY_AUTHOR_KIND";
 const HISTORY_INTENT_ENV: &str = "ATUIN_HISTORY_INTENT";
 
 /// The author identity exported by the invoking integration (`ATUIN_HISTORY_AUTHOR`).
+#[must_use]
 pub fn probe_author() -> Option<String> {
     normalize_optional_string(env::var(HISTORY_AUTHOR_ENV).ok())
 }
@@ -129,6 +135,7 @@ impl Version {
     pub const VARIANTS: [Self; 3] = [Self::Zero, Self::One, Self::Two];
     pub const LATEST: Self = Self::Two;
 
+    #[must_use]
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
             "v0" => Some(Self::Zero),
@@ -138,6 +145,7 @@ impl Version {
         }
     }
 
+    #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Zero => "v0",
@@ -146,10 +154,12 @@ impl Version {
         }
     }
 
+    #[must_use]
     pub const fn as_int(&self) -> u16 {
         *self as u16
     }
 
+    #[must_use]
     pub fn min_fields(&self) -> u32 {
         match self {
             Self::Zero => 9,
@@ -158,6 +168,7 @@ impl Version {
         }
     }
 
+    #[must_use]
     pub fn max_fields(&self) -> Option<u32> {
         match self {
             Self::Zero => Some(9),
@@ -180,9 +191,94 @@ const LATEST_SERIALIZED_FIELDS: u32 = 13;
 /// [`LATEST_SERIALIZED_FIELDS`].
 const V2_AUTHOR_KIND_FIELD_NUMBER: u32 = 13;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, derive_more::Display, derive_more::From)]
-#[display("{_0}")]
-pub struct HistoryId(pub String);
+// Because of how our encoding/decoding protocol worked, unlike all other UUID types in Atuin, which
+// use hyphenated encoding, this one displays as the simple (hyphen-less) representation. This
+// `Display` is the single source of that form — `.to_string()` derives from it.
+//
+// Be very, very careful changing this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, derive_more::Display, derive_more::From)]
+#[display("{}", _0.as_simple())]
+pub struct HistoryId(uuid::Uuid);
+
+impl std::str::FromStr for HistoryId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(uuid::Uuid::parse_str(s)?))
+    }
+}
+
+impl Serialize for HistoryId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HistoryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for HistoryId {
+    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Sqlite> for HistoryId {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <String as sqlx::Encode<sqlx::Sqlite>>::encode(self.to_string(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for HistoryId {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <&str as sqlx::Decode<sqlx::Sqlite>>::decode(value)?;
+        Ok(s.parse()?)
+    }
+}
+
+impl HistoryId {
+    #[must_use]
+    pub fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+
+    /// Reconstruct a [`HistoryId`] from the raw 16 bytes of its UUID.
+    ///
+    /// This is the inverse of [`HistoryId::into_bytes`].
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    #[must_use]
+    pub fn to_string(&self) -> String {
+        self.0.as_simple().to_string()
+    }
+}
 
 /// Client-side history entry.
 ///
@@ -279,7 +375,7 @@ impl History {
         let shell = normalize_optional_string(shell);
 
         Self {
-            id: uuid_v7().as_simple().to_string().into(),
+            id: HistoryId::from(uuid_v7()),
             timestamp,
             command,
             cwd,
@@ -302,6 +398,7 @@ impl History {
     /// recorded in the entry's origin, in which case the author is just the default it fell back
     /// to and tells us nothing. That exception is what stops a user called `pi` from looking like
     /// the `pi` agent.
+    #[must_use]
     pub fn is_agent(&self) -> bool {
         match self.author_kind {
             Some(kind) => kind == AuthorKind::Agent,
@@ -338,7 +435,7 @@ impl History {
         encode::write_u16(&mut output, Version::LATEST.as_int())?;
         encode::write_array_len(&mut output, LATEST_SERIALIZED_FIELDS)?;
 
-        encode::write_str(&mut output, &self.id.0)?;
+        encode::write_str(&mut output, &self.id.to_string())?;
         encode::write_u64(&mut output, self.timestamp.unix_timestamp_nanos() as u64)?;
         encode::write_sint(&mut output, self.duration)?;
         encode::write_sint(&mut output, self.exit)?;
@@ -427,7 +524,7 @@ impl History {
         }
 
         Ok(Self {
-            id: id.into(),
+            id: id.parse()?,
             timestamp: OffsetDateTime::from_unix_nanos_u64(timestamp),
             duration,
             exit,
@@ -591,6 +688,7 @@ impl History {
         builder::HistoryFromDb::builder()
     }
 
+    #[must_use]
     pub fn success(&self) -> bool {
         self.exit == 0 || self.duration == -1
     }
@@ -794,9 +892,9 @@ mod tests {
 
     #[rstest]
     #[case::basic(History {
-        id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
         timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-        duration: 49206000,
+        duration: 49_206_000,
         exit: 0,
         command: "git status".to_owned(),
         cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
@@ -809,9 +907,9 @@ mod tests {
         author_kind: None,
     })]
     #[case::deleted(History {
-        id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
         timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-        duration: 49206000,
+        duration: 49_206_000,
         exit: 0,
         command: "git status".to_owned(),
         cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
@@ -824,9 +922,9 @@ mod tests {
         author_kind: Some(AuthorKind::User),
     })]
     #[case::with_author_and_intent(History {
-        id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
         timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-        duration: 49206000,
+        duration: 49_206_000,
         exit: 0,
         command: "git status".to_owned(),
         cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
@@ -875,9 +973,9 @@ mod tests {
 
     fn expected_v2() -> History {
         History {
-            id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
+            id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
             timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-            duration: 49206000,
+            duration: 49_206_000,
             exit: 0,
             command: "git status".to_owned(),
             cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
@@ -885,7 +983,7 @@ mod tests {
             cmd_origin: CmdOrigin::try_from("fvfg936c0kpf:conrad.ludgate").unwrap(),
             author: "conrad.ludgate".to_owned(),
             intent: Some("sample intent".to_owned()),
-            deleted_at: Some(time::OffsetDateTime::from_unix_timestamp(1784080673).unwrap()),
+            deleted_at: Some(time::OffsetDateTime::from_unix_timestamp(1_784_080_673).unwrap()),
             shell: Some("zsh".into()),
             author_kind: None,
         }

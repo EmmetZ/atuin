@@ -1,15 +1,15 @@
 use std::io::BufRead;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
-use atuin_client::history::AuthorPattern;
-use atuin_common::ansi::{self, Vt100ParserExt as _};
+use atuin_client::history::{AuthorPattern, HistoryId};
+use atuin_common::ansi;
 use atuin_common::filter::OrFilter;
 use atuin_common::time::UtcOffsetExt;
 use enum_dispatch::enum_dispatch;
 use eyre::Result;
-use uuid::Uuid;
 
 const DEFAULT_FILE_READ_LINES: u64 = 100;
 const MAX_FILE_READ_LINES: u64 = 1000;
@@ -104,16 +104,16 @@ impl ToolOutcome {
 
                 parts.push(format!("Duration: {duration_ms}ms"));
 
-                if !stdout.is_empty() {
-                    parts.push(format!("stdout:\n{stdout}"));
-                } else {
+                if stdout.is_empty() {
                     parts.push("stdout: (empty)".to_string());
+                } else {
+                    parts.push(format!("stdout:\n{stdout}"));
                 }
 
-                if !stderr.is_empty() {
-                    parts.push(format!("stderr:\n{stderr}"));
-                } else {
+                if stderr.is_empty() {
                     parts.push("stderr: (empty)".to_string());
+                } else {
+                    parts.push(format!("stderr:\n{stderr}"));
                 }
 
                 if *interrupted {
@@ -302,6 +302,7 @@ impl ReadToolCall {
         }
     }
 
+    #[must_use]
     pub fn execute(&self) -> ToolOutcome {
         let path = self.resolved_path();
 
@@ -443,6 +444,7 @@ impl EditToolCall {
     ///
     /// Callers should snapshot the file before calling this method and
     /// update the file tracker after a successful return.
+    #[must_use]
     pub fn execute(
         &self,
         resolved_path: &Path,
@@ -628,6 +630,7 @@ impl WriteToolCall {
     ///
     /// Creates a new file or overwrites an existing one (if `overwrite` is set).
     /// Returns the outcome and the written bytes (for tracker updates).
+    #[must_use]
     pub fn execute(&self, resolved_path: &Path) -> (ToolOutcome, Option<Vec<u8>>) {
         if resolved_path.is_dir() {
             return (
@@ -782,10 +785,10 @@ impl PermissibleToolCall for ShellToolCall {
 }
 
 /// Preview viewport height for VT100 emulation.
-const PREVIEW_HEIGHT: u16 = 10;
+const PREVIEW_HEIGHT: NonZeroU16 = NonZeroU16::new(10).unwrap();
 
 /// Default terminal width for VT100 emulation.
-const PREVIEW_WIDTH: u16 = 120;
+const PREVIEW_WIDTH: NonZeroU16 = NonZeroU16::new(120).unwrap();
 
 /// Extract plain text lines from a VT100 screen buffer.
 ///
@@ -849,7 +852,7 @@ pub async fn execute_shell_command_streaming(
     let stderr = child.stderr.take().expect("stderr was piped");
 
     // VT100 emulator for the live preview (viewport-sized)
-    let mut parser = vt100::Parser::new_safe(PREVIEW_HEIGHT, PREVIEW_WIDTH, 0);
+    let mut parser = vt100::Parser::new(PREVIEW_HEIGHT, PREVIEW_WIDTH, 0);
 
     let mut stdout_reader = tokio::io::BufReader::new(stdout);
     let mut stderr_reader = tokio::io::BufReader::new(stderr);
@@ -941,7 +944,7 @@ pub async fn execute_shell_command_streaming(
 
     // Strip ANSI escape sequences for clean LLM output by running
     // the raw bytes through a VT100 parser and extracting plain text.
-    let cols = NonZeroU16::new(PREVIEW_WIDTH).expect("PREVIEW_WIDTH is nonzero");
+    let cols = PREVIEW_WIDTH;
     let stdout_text = ansi::to_plain_text(&full_stdout, cols);
     let stderr_text = ansi::to_plain_text(&full_stderr, cols);
 
@@ -1116,7 +1119,7 @@ impl AtuinHistoryToolCall {
 
 #[derive(Debug, Clone)]
 pub struct AtuinOutputToolCall {
-    pub history_id: Uuid,
+    pub history_id: HistoryId,
     pub ranges: Vec<(i64, i64)>,
     /// The command the history entry ran, resolved from the local history
     /// db after parsing (`Effect::ResolveOutputCommand`). Display-only:
@@ -1128,11 +1131,11 @@ impl TryFrom<&serde_json::Value> for AtuinOutputToolCall {
     type Error = eyre::Error;
 
     fn try_from(value: &serde_json::Value) -> Result<Self, Self::Error> {
-        let history_id = value
+        let history_id: HistoryId = value
             .get("history_id")
             .and_then(|v| v.as_str())
-            .and_then(|v| Uuid::parse_str(v).ok())
-            .ok_or(eyre::eyre!("Missing or invalid history ID"))?;
+            .and_then(|s| HistoryId::from_str(s).ok())
+            .ok_or_else(|| eyre::eyre!("Missing or invalid history ID"))?;
 
         let ranges =
             value.get("ranges").and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or(&[]);
@@ -1206,8 +1209,8 @@ impl AtuinOutputToolCall {
             Err(e) => return ToolOutcome::Error(format!("Failed to connect to Atuin daemon: {e}")),
         };
 
-        let history_id = self.history_id.as_simple().to_string();
-        let response = match client.command_output(history_id.clone(), self.ranges.clone()).await {
+        let history_id = self.history_id;
+        let response = match client.command_output(history_id, self.ranges.clone()).await {
             Ok(response) => response,
             Err(e) => return ToolOutcome::Error(format!("Failed to fetch command output: {e}")),
         };
@@ -1344,7 +1347,7 @@ mod tests {
 
         let call = AtuinOutputToolCall::try_from(&input)?;
 
-        assert_eq!(call.history_id.as_simple().to_string(), "018f0000000070008000000000000000");
+        assert_eq!(call.history_id.to_string(), "018f0000000070008000000000000000");
         assert!(call.ranges.is_empty());
         Ok(())
     }

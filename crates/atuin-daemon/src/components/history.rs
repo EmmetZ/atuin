@@ -54,6 +54,7 @@ struct HistoryComponentInner {
 
 impl HistoryComponent {
     /// Create a new history component.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(HistoryComponentInner {
@@ -67,6 +68,7 @@ impl HistoryComponent {
     /// Get the gRPC service for this component.
     ///
     /// This returns a tonic service that can be added to a gRPC server.
+    #[must_use]
     pub fn grpc_service(&self) -> HistoryServer<HistoryGrpcService> {
         HistoryServer::new(HistoryGrpcService {
             inner: self.inner.clone(),
@@ -121,7 +123,7 @@ fn history_to_tail_reply(kind: HistoryEventKind, history: History) -> TailHistor
         kind: kind as i32,
         history: Some(HistoryEntry {
             timestamp: history.timestamp.unix_timestamp_nanos() as u64,
-            id: history.id.0,
+            id: history.id.to_string(),
             command: history.command,
             cwd: history.cwd,
             session: history.session,
@@ -170,9 +172,9 @@ impl HistorySvc for HistoryGrpcService {
             handle.emit(DaemonEvent::HistoryStarted(h.clone()));
         }
 
-        let id = h.id.clone();
+        let id = h.id;
         tracing::info!(id = id.to_string(), "start history");
-        self.inner.running.insert(id.clone(), h);
+        self.inner.running.insert(id, h);
 
         let reply = StartHistoryReply {
             id: id.to_string(),
@@ -189,7 +191,10 @@ impl HistorySvc for HistoryGrpcService {
         request: Request<EndHistoryRequest>,
     ) -> Result<Response<EndHistoryReply>, Status> {
         let req = request.into_inner();
-        let id = HistoryId(req.id);
+        let id: HistoryId = req
+            .id
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("invalid history id: {}", req.id)))?;
 
         if let Some((_, mut history)) = self.inner.running.remove(&id) {
             history.exit = req.exit;
@@ -228,7 +233,7 @@ impl HistorySvc for HistoryGrpcService {
                 .await
                 .map_err(|e| Status::internal(format!("failed to write to db: {e:?}")))?;
 
-            tracing::info!(id = id.0.to_string(), duration = history.duration, "end history");
+            tracing::info!(id = %id, duration = history.duration, "end history");
 
             // Push to record store
             let (record_id, idx) = history_store
@@ -268,7 +273,10 @@ impl HistorySvc for HistoryGrpcService {
         request: Request<CancelHistoryRequest>,
     ) -> Result<Response<CancelHistoryReply>, Status> {
         let req = request.into_inner();
-        let id = HistoryId(req.id);
+        let id: HistoryId = req
+            .id
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("invalid history id: {}", req.id)))?;
         if self.inner.running.remove(&id).is_some() {
             Ok(Response::new(CancelHistoryReply {
                 version: env!("CARGO_PKG_VERSION").to_string(),

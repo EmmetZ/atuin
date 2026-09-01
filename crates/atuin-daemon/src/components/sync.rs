@@ -52,6 +52,7 @@ pub struct SyncComponent {
 
 impl SyncComponent {
     /// Create a new sync component.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             task_handle: None,
@@ -210,6 +211,10 @@ async fn do_sync_tick(
         }
     };
 
+    if let Err(e) = handle.caps().refresh().await {
+        tracing::debug!("capability refresh failed, keeping cached document: {e}");
+    }
+
     if !logged_in {
         tracing::debug!("not logged in, skipping sync tick");
         return SyncState::Idle;
@@ -274,8 +279,7 @@ async fn do_sync_tick(
                 match batch {
                     Ok(histories) if !histories.is_empty() => {
                         // Only the IDs go on the bus; the rows themselves are already in sqlite.
-                        let ids: Arc<[HistoryId]> =
-                            histories.iter().map(|h| h.id.clone()).collect();
+                        let ids: Arc<[HistoryId]> = histories.iter().map(|h| h.id).collect();
                         handle.emit(DaemonEvent::HistorySynced(ids));
                     }
                     Ok(_) => {}

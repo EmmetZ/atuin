@@ -124,6 +124,7 @@ pub struct SearchComponent {
 
 impl SearchComponent {
     /// Create a new search component.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             index: Arc::new(RwLock::new(SearchIndex::default())),
@@ -134,6 +135,7 @@ impl SearchComponent {
     }
 
     /// Get the gRPC service for this component.
+    #[must_use]
     pub fn grpc_service(&self) -> SearchGrpcServiceBuilder {
         SearchGrpcServiceBuilder {
             index: self.index.clone(),
@@ -214,7 +216,7 @@ impl Component for SearchComponent {
                     return Ok(());
                 };
 
-                let histories = handle.history_db().load_active(ids.iter().cloned()).await?;
+                let histories = handle.history_db().load_active(ids.iter().copied()).await?;
                 self.index.read().await.add_histories(&histories);
             }
             DaemonEvent::HistoryStarted(history) => {
@@ -269,6 +271,7 @@ pub struct SearchGrpcServiceBuilder {
 }
 
 impl SearchGrpcServiceBuilder {
+    #[must_use]
     pub fn build(self, handle: DaemonHandle) -> SearchServer<SearchGrpcService> {
         SearchServer::new(SearchGrpcService {
             index: self.index,

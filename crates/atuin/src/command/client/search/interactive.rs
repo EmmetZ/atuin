@@ -67,13 +67,13 @@ pub struct InspectingState {
 
 impl InspectingState {
     pub fn move_to_previous(&mut self) {
-        let previous = self.previous.clone();
+        let previous = self.previous;
         self.reset();
         self.current = previous;
     }
 
     pub fn move_to_next(&mut self) {
-        let next = self.next.clone();
+        let next = self.next;
         self.reset();
         self.current = next;
     }
@@ -223,6 +223,7 @@ impl State {
         }
     }
 
+    #[must_use]
     fn handle_input(&mut self, settings: &Settings, input: &Event) -> InputAction {
         match input {
             Event::Key(k) => self.handle_key_input(settings, k),
@@ -331,6 +332,7 @@ impl State {
             )
     }
 
+    #[must_use]
     fn handle_key_input(&mut self, settings: &Settings, input: &KeyEvent) -> InputAction {
         use super::keybindings::key::{KeyCodeValue, KeyInput, SingleKey};
         use super::keybindings::{Action, EvalContext};
@@ -456,6 +458,7 @@ impl State {
     /// for `settings.invert` so that keybindings are always in "visual" terms —
     /// users never need to think about invert in their keybinding config.
     #[allow(clippy::too_many_lines)]
+    #[must_use]
     pub(crate) fn execute_action(
         &mut self,
         action: &super::keybindings::Action,
@@ -1503,6 +1506,10 @@ fn fetch_screen_state(socket_path: &str) -> Option<SavedScreen> {
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(socket_path).ok()?;
+    // We only read from this socket, but an older version of the PTY proxy might be waiting up to
+    // 100ms for us to send a magic byte we never do; shut down the write end of the socket
+    // immediately to cancel the timeout.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
 
     let mut data = Vec::new();
@@ -1911,7 +1918,7 @@ pub async fn history(
         let initial_input = app.search.input.as_str().to_owned();
         let initial_filter_mode = app.search.filter_mode;
         let initial_search_mode = app.search_mode();
-        let initial_custom_context = app.search.custom_context.clone();
+        let initial_custom_context = app.search.custom_context;
 
         let event_ready = tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(250)));
 
@@ -1952,7 +1959,8 @@ pub async fn history(
                                 // Query the DB for ALL entries with this command and delete them
                                 let all_matching = db.query_history(
                                     &format!(
-                                        "select * from history where command = '{}' and deleted_at is null",
+                                        "select {} from history where command = '{}' and deleted_at is null",
+                                        atuin_client::database::HISTORY_COLUMNS,
                                         command.replace('\'', "''")
                                     )
                                 ).await?;
@@ -1967,7 +1975,7 @@ pub async fn history(
                             },
                             InputAction::SwitchContext(index) => {
                                 if let Some(index) = index && let Some(entry) = results.get(index) {
-                                    app.search.custom_context = Some(entry.id.clone());
+                                    app.search.custom_context = Some(entry.id);
                                     app.search.context = Context::from_history(entry);
                                     app.search.filter_mode = FilterMode::Session;
                                     app.search.input = Cursor::from(String::new());
@@ -2021,7 +2029,7 @@ pub async fn history(
             && app.search.input.as_str().is_empty()
             && (initial_custom_context != app.search.custom_context
                 || initial_filter_mode != app.search.filter_mode)
-            && let Some(history_id) = app.search.custom_context.clone()
+            && let Some(history_id) = app.search.custom_context
             && let Some(pos) = results.iter().position(|entry| entry.id == history_id)
         {
             app.results_state.select(pos);
@@ -2032,7 +2040,7 @@ pub async fn history(
         match inspecting_id {
             Some(inspecting_id) => {
                 if inspecting.is_none() || inspecting_id != inspecting.clone().unwrap().id {
-                    inspecting = db.load(inspecting_id.0.as_str()).await?;
+                    inspecting = db.load(inspecting_id).await?;
                 }
             }
             _ => {
@@ -2056,7 +2064,7 @@ pub async fn history(
                 stats
             } else {
                 let stats = db.stats(&selected).await?;
-                stats_for = Some(selected.id.clone());
+                stats_for = Some(selected.id);
                 app.inspecting_state.current = Some(selected.id);
                 app.inspecting_state.previous = match stats.previous.clone() {
                     Some(p) => Some(p.id),
@@ -2463,12 +2471,12 @@ mod tests {
 
         // Press 'g' to set pending state
         let g_event = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
-        state.handle_key_input(&settings, &g_event);
+        let _ = state.handle_key_input(&settings, &g_event);
         assert_eq!(state.pending_vim_key, Some('g'));
 
         // Press 'j' - should clear pending state
         let j_event = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        state.handle_key_input(&settings, &j_event);
+        let _ = state.handle_key_input(&settings, &j_event);
         assert_eq!(state.pending_vim_key, None);
     }
 
@@ -2588,9 +2596,9 @@ mod tests {
         use crate::command::client::search::keybindings::Action;
 
         assert_eq!(state.tab_index, 0);
-        state.execute_action(&Action::ToggleTab, &settings);
+        let _ = state.execute_action(&Action::ToggleTab, &settings);
         assert_eq!(state.tab_index, 1);
-        state.execute_action(&Action::ToggleTab, &settings);
+        let _ = state.execute_action(&Action::ToggleTab, &settings);
         assert_eq!(state.tab_index, 0);
     }
 
@@ -2602,7 +2610,7 @@ mod tests {
         use crate::command::client::search::keybindings::Action;
 
         assert!(!state.prefix);
-        state.execute_action(&Action::EnterPrefixMode, &settings);
+        let _ = state.execute_action(&Action::EnterPrefixMode, &settings);
         assert!(state.prefix);
     }
 
@@ -2637,7 +2645,7 @@ mod tests {
         state.tab_index = 1;
 
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        state.handle_key_input(&settings, &ctrl_a);
+        let _ = state.handle_key_input(&settings, &ctrl_a);
         assert!(state.prefix, "ctrl-a should enter prefix mode in inspector");
 
         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
@@ -2786,7 +2794,7 @@ mod tests {
         state.search_mode_state = SearchModeState::new(&settings);
         assert_eq!(state.search_mode(), SearchMode::DaemonFuzzy);
         state.engine = engines::engine(SearchMode::DaemonFuzzy, &settings);
-        let mut db = Sqlite::new("sqlite::memory:", 2.0).await.unwrap();
+        let mut db = Sqlite::in_memory(std::time::Duration::from_secs(2)).await.unwrap();
         let history: History = History::capture()
             .timestamp(OffsetDateTime::now_utc())
             .command("echo query match")
@@ -2805,7 +2813,7 @@ mod tests {
         assert!(state.search_mode_state.is_failed_daemon_fuzzy());
 
         state.search_mode_state.mode = SearchMode::FullText;
-        state.execute_action(&Action::CycleSearchMode, &settings);
+        let _ = state.execute_action(&Action::CycleSearchMode, &settings);
         assert_eq!(state.search_mode_state.raw_mode(), SearchMode::DaemonFuzzy);
         assert_eq!(state.search_mode(), SearchMode::Fuzzy);
     }
@@ -2843,19 +2851,19 @@ mod tests {
         // cursor is at end (position 5)
 
         // CursorLeft
-        state.execute_action(&Action::CursorLeft, &settings);
+        let _ = state.execute_action(&Action::CursorLeft, &settings);
         assert_eq!(state.search.input.position(), 4);
 
         // CursorStart
-        state.execute_action(&Action::CursorStart, &settings);
+        let _ = state.execute_action(&Action::CursorStart, &settings);
         assert_eq!(state.search.input.position(), 0);
 
         // CursorEnd
-        state.execute_action(&Action::CursorEnd, &settings);
+        let _ = state.execute_action(&Action::CursorEnd, &settings);
         assert_eq!(state.search.input.position(), 5);
 
         // CursorRight at end does nothing
-        state.execute_action(&Action::CursorRight, &settings);
+        let _ = state.execute_action(&Action::CursorRight, &settings);
         assert_eq!(state.search.input.position(), 5);
     }
 
@@ -2871,11 +2879,11 @@ mod tests {
         state.search.input.insert('o');
 
         // DeleteCharBefore (backspace)
-        state.execute_action(&Action::DeleteCharBefore, &settings);
+        let _ = state.execute_action(&Action::DeleteCharBefore, &settings);
         assert_eq!(state.search.input.as_str(), "hell");
 
         // ClearLine
-        state.execute_action(&Action::ClearLine, &settings);
+        let _ = state.execute_action(&Action::ClearLine, &settings);
         assert_eq!(state.search.input.as_str(), "");
     }
 
