@@ -61,6 +61,7 @@ mod sqlite;
 use async_trait::async_trait;
 use atuin_common::db::OwnedDbUrl;
 use atuin_domain::record::{EncryptedData, Record, RecordIdx, RecordSeriesKey, RecordStatus};
+use easy_cast::Conv;
 use serde::{Deserialize, Serialize};
 pub use sqlite::Sqlite;
 mod mysql;
@@ -189,6 +190,7 @@ pub trait DynDatabase: Send + Sync + 'static {
     async fn get_user(&self, username: &str) -> DbResult<User>;
     async fn get_user_session(&self, u: &User) -> DbResult<Session>;
     async fn add_user(&self, user: &NewUser) -> DbResult<i64>;
+    async fn add_user_with_session(&self, user: &NewUser, token: &str) -> DbResult<i64>;
 
     async fn update_user_password(&self, u: &User) -> DbResult<()>;
 
@@ -296,6 +298,25 @@ where
         Ok(res.0)
     }
 
+    /// Atomically create a user and their initial session in a single transaction.
+    #[instrument(skip_all)]
+    async fn add_user_with_session(&self, user: &NewUser, token: &str) -> DbResult<i64> {
+        let mut tx = self.pool().begin().await?;
+
+        let (user_id,): (i64,) = db::query_as(Self::Dialect::ADD_USER)
+            .bind(user.username.as_str())
+            .bind(user.email.as_str())
+            .bind(user.password.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+
+        db::query(Self::Dialect::ADD_SESSION).bind(user_id).bind(token).execute(&mut *tx).await?;
+
+        tx.commit().await?;
+
+        Ok(user_id)
+    }
+
     #[instrument(skip_all)]
     async fn update_user_password(&self, user: &User) -> DbResult<()> {
         db::query(Self::Dialect::UPDATE_USER_PASSWORD)
@@ -308,10 +329,12 @@ where
 
     #[instrument(skip_all)]
     async fn delete_user(&self, u: &User) -> DbResult<()> {
-        db::query(Self::Dialect::DELETE_SESSIONS_BY_USER).bind(u.id).execute(self.pool()).await?;
-        db::query(Self::Dialect::DELETE_HISTORY_BY_USER).bind(u.id).execute(self.pool()).await?;
-        db::query(Self::Dialect::DELETE_STORE_BY_USER).bind(u.id).execute(self.pool()).await?;
-        db::query(Self::Dialect::DELETE_USER_BY_ID).bind(u.id).execute(self.pool()).await?;
+        let mut tx = self.pool().begin().await?;
+        db::query(Self::Dialect::DELETE_SESSIONS_BY_USER).bind(u.id).execute(&mut *tx).await?;
+        db::query(Self::Dialect::DELETE_HISTORY_BY_USER).bind(u.id).execute(&mut *tx).await?;
+        db::query(Self::Dialect::DELETE_STORE_BY_USER).bind(u.id).execute(&mut *tx).await?;
+        db::query(Self::Dialect::DELETE_USER_BY_ID).bind(u.id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -332,8 +355,9 @@ where
                 .bind(id)
                 .bind(i.id)
                 .bind(i.host.id)
-                .bind(i.idx as i64)
-                .bind(i.timestamp as i64) // throwing away some data, but i64 is still big in terms of time
+                .bind(i64::conv(i.idx))
+                // throwing away some data, but i64 is still big in terms of time
+                .bind(i64::conv(i.timestamp))
                 .bind(i.version.as_str())
                 .bind(i.tag.as_str())
                 .bind(i.data.raw.as_str())
@@ -363,8 +387,8 @@ where
             .bind(user.id)
             .bind(series.tag.as_str())
             .bind(series.host_id)
-            .bind(start as i64)
-            .bind(count as i64)
+            .bind(i64::conv(start))
+            .bind(i64::conv(count))
             .fetch_all(self.pool())
             .await
             .map(|records| records.into_iter().map(Into::into).collect())
@@ -419,6 +443,10 @@ where
 
     async fn add_user(&self, user: &NewUser) -> DbResult<i64> {
         Database::add_user(self, user).await
+    }
+
+    async fn add_user_with_session(&self, user: &NewUser, token: &str) -> DbResult<i64> {
+        Database::add_user_with_session(self, user, token).await
     }
 
     async fn update_user_password(&self, u: &User) -> DbResult<()> {
