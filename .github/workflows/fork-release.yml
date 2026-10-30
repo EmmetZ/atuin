@@ -85,5 +85,9 @@ jobs:
             gh release create dev-latest --repo "$GITHUB_REPOSITORY" \
               --prerelease --title "dev-latest" --notes "$notes" --target "$GITHUB_SHA"
           fi
+          # 清理旧 commit 遗留的资产，保证 dev-latest 只保留最新一份
+          for a in $(gh release view dev-latest --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+            gh release delete-asset dev-latest "$a" --repo "$GITHUB_REPOSITORY" --yes
+          done
           gh release upload dev-latest "$ARCHIVE" "$ARCHIVE.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
