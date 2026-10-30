@@ -11,10 +11,12 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use eyre::Result;
+use secrecy::SecretString;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
 use super::handlers;
+use crate::client_ip::{self, TrustedProxies};
 use crate::db::models::User;
 use crate::db::{DbError, DynDatabase};
 use crate::handlers::{ErrorResponseStatus, RespExt};
@@ -53,7 +55,8 @@ impl FromRequestParts<AppState> for UserAuth {
                 .with_status(http::StatusCode::BAD_REQUEST));
         }
 
-        let user = state.database.get_session_user(token).await.map_err(|e| match e {
+        let token = SecretString::from(token);
+        let user = state.database.get_session_user(&token).await.map_err(|e| match e {
             DbError::NotFound => {
                 tracing::warn!("presented session token was not recognised");
                 ErrorResponse::reply("session not found").with_status(http::StatusCode::FORBIDDEN)
@@ -134,10 +137,20 @@ pub fn router(database: Arc<dyn DynDatabase>, settings: Settings) -> Router {
     let unnegotiated =
         Router::new().route("/api/v0/capabilities", get(capabilities_endpoint)).with_state(caps);
 
+    // The client address is resolved before the request span is created so the span, and every
+    // handler beneath it, sees the real client rather than the reverse proxy.
+    let trusted_proxies = TrustedProxies::new(
+        settings.trusted_proxies.clone(),
+        settings.trusted_proxy_header.clone(),
+    );
     let traced = unnegotiated.merge(negotiated).layer(
-        TraceLayer::new_for_http()
-            .make_span_with(crate::trace::make_request_span)
-            .on_response(crate::trace::on_response),
+        ServiceBuilder::new()
+            .layer(axum::middleware::from_fn_with_state(trusted_proxies, client_ip::resolve))
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(crate::trace::make_request_span)
+                    .on_response(crate::trace::on_response),
+            ),
     );
 
     let routes = Router::new().route("/healthz", get(handlers::health::health_check)).merge(traced);

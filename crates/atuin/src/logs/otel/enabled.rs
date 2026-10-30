@@ -4,22 +4,25 @@ use std::env::VarError;
 use std::ffi::OsString;
 use std::str::FromStr;
 
+use atuin_common::userio::log::UserFilterExt as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{ExporterBuildError, WithExportConfig as _};
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::registry::LookupSpan;
 use url::Url;
 
+use crate::i18n::fl;
+
 #[derive(Debug, thiserror::Error)]
 pub enum OtelCtxEnableError {
-    #[error("the given ATUIN_OTEL URL does not appear to be a utf-8 string")]
+    #[error("{}", fl!("otel-url-not-utf8"))]
     NonUtf8EnvVar(OsString),
-    #[error("the given ATUIN_OTEL failed to parse as URL: {0}")]
+    #[error("{}", fl!("otel-url-invalid", error = .0.to_string()))]
     InvalidUrl(#[from] url::ParseError),
-    #[error("the given ATUIN_OTEL URL does not appear to be an HTTP(s) URL")]
+    #[error("{}", fl!("otel-url-not-http"))]
     NonHttpUrl,
-    #[error("failed to construct the exporter: {0}")]
+    #[error("{}", fl!("otel-exporter-build-failed", error = .0.to_string()))]
     ExporterBuild(#[from] ExporterBuildError),
 }
 
@@ -33,7 +36,7 @@ impl OtelCtx {
     pub fn try_enable(service_name: &'static str) -> Result<Option<Self>, OtelCtxEnableError> {
         // TODO(markovejnovic): We should really have our own env-var parsing logic to avoid
         // this annoying error handling here.
-        let otel_env: Option<String> = match std::env::var("ATUIN_OTEL") {
+        let otel_env: Option<String> = match atuin_common::env::var("ATUIN_OTEL") {
             Ok(v) => Some(v),
             Err(e) => match e {
                 VarError::NotPresent => None,
@@ -88,7 +91,7 @@ impl OtelCtx {
         tracing_opentelemetry::layer()
             .with_tracer(self.provider.tracer(service_name))
             .with_context_activation(false)
-            .with_filter(LevelFilter::TRACE)
+            .with_filter(Targets::new().with_default(LevelFilter::TRACE).without_user_messages())
     }
 }
 

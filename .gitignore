@@ -26,3 +26,6 @@ test-behavior.sh
 # vocabulary under .vale/styles/config/ is source.
 /.vale/styles/*
 !/.vale/styles/config/
+test-results/
+
+/crates/atuin/wix/License.rtf

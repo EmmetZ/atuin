@@ -1,46 +1,51 @@
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use atuin_client::api_client::Client;
 use atuin_client::record::sqlite_store::SqliteStore;
-use atuin_client::record::sync::{ClientSource, Operation, SyncEngine};
+use atuin_client::record::sync::{ClientSource, Operation, SyncSession};
 use atuin_client::settings::Settings;
 use atuin_common::encryption::paseto_v4;
+use atuin_common::userio;
 use atuin_domain::record::{HostId, RecordTag};
 use clap::Args;
 use eyre::{Context as _, Result};
 use uuid::Uuid;
 
+use crate::i18n::fl;
+
 #[derive(Args, Debug)]
 pub struct Push {
-    /// The tag to push (eg, 'history'). Defaults to all tags
-    #[arg(long, short)]
+    #[arg(long, short, help = fl!("arg-store-tag"))]
     pub tag: Option<RecordTag>,
 
-    /// The host to push, in the form of a UUID host ID. Defaults to the current host.
-    #[arg(long)]
+    #[arg(long, help = fl!("arg-store-push-host"))]
     pub host: Option<Uuid>,
 
-    /// Force push records
-    ///
-    /// This will override both host and tag, to be all hosts and all tags. First clear the remote store, then upload all of the
-    /// local store
-    #[arg(long, default_value = "false")]
+    #[arg(
+        long,
+        default_value = "false",
+        help = fl!("arg-store-push-force"),
+        long_help = fl!("arg-store-push-force", "long")
+    )]
     pub force: bool,
 
-    /// Page Size
-    ///
-    /// How many records to upload at once. Defaults to 100
-    #[arg(long, default_value = "100")]
+    #[arg(
+        long,
+        default_value = "100",
+        help = fl!("arg-store-push-page"),
+        long_help = fl!("arg-store-push-page", "long")
+    )]
     pub page: NonZeroU64,
 }
 
 impl Push {
-    pub async fn run(&self, settings: &Settings, store: SqliteStore) -> Result<()> {
-        let host_id = Settings::host_id().await?;
+    pub async fn run(&self, settings: &Arc<Settings>, store: SqliteStore) -> Result<()> {
+        let host_id = settings.host_id().await?;
 
         if self.force {
-            println!("Forcing remote store overwrite!");
-            println!("Clearing remote store");
+            userio::log::info!("store-push-force");
+            userio::log::info!("store-push-clear");
 
             let caps = atuin_client::api_client::caps_client(settings)?;
             let client = Client::new(
@@ -65,7 +70,7 @@ impl Push {
         //  b) are they for the host/tag we are pushing here?
         let key = paseto_v4::Key::try_load_from_path(&settings.key_path)
             .context("could not load encryption key")?;
-        let engine = SyncEngine::builder()
+        let session = SyncSession::builder()
             .store(store)
             .client_source(ClientSource::FromSettings {
                 settings,
@@ -76,17 +81,17 @@ impl Push {
             .await?
             .with_page_size(self.page);
 
-        let keyed = engine.keyed(&key);
-        let (diff, remote_index) = engine.diff().await?;
+        let keyed = session.keyed(&key);
+        let (diff, remote_index) = session.diff().await?;
 
         // Skip on --force: that path intentionally replaces remote with local.
         if !self.force
             && let Some(err) = keyed.key_valid_against(&remote_index).await
         {
-            return Err(crate::print_error::format_sync_error(err));
+            return Err(err.into());
         }
 
-        let operations = SyncEngine::operations(diff)?;
+        let operations = SyncSession::operations(diff)?;
 
         let operations = operations
             .into_iter()
@@ -121,7 +126,7 @@ impl Push {
 
         let (uploaded, _) = keyed.sync_remote(operations).await?;
 
-        println!("Uploaded {uploaded} records");
+        userio::log::info!("store-push-uploaded", count = uploaded);
 
         Ok(())
     }

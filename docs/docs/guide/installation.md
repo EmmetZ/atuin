@@ -42,6 +42,15 @@ Write-Output 'atuin init powershell | Out-String | Invoke-Expression' >> $PROFIL
 
 Note that the `$PROFILE` path may depend on your PowerShell version.
 
+!!! tip "Installing for every user"
+
+    By default, WinGet installs Atuin for your user only, which doesn't need administrator rights.
+    To install it for every user on the machine, add `--scope machine`:
+
+    ```shell
+    winget install -e Atuinsh.Atuin --scope machine
+    ```
+
 You may also want to try the `default-powershell` [theme](theming.md), which uses the default PowerShell syntax colors.
 
 [**Set up sync** - Move on to the next step.](sync.md)
@@ -73,7 +82,7 @@ If you don't wish to use the installer, the manual installation steps are as fol
 
 === "MacPorts"
 
-    Atuin is also available in [MacPorts](https://ports.macports.org/port/atuin/)
+    Atuin is also available in [MacPorts](https://ports.macports.org/port/atuin/):
 
     ```shell
     sudo port install atuin
@@ -81,7 +90,7 @@ If you don't wish to use the installer, the manual installation steps are as fol
 
 === "mise"
 
-    Atuin is also installable using [mise](https://github.com/jdx/mise)
+    Atuin is also installable using [mise](https://github.com/jdx/mise):
 
     ```shell
     mise use -g atuin@latest
@@ -95,11 +104,7 @@ If you don't wish to use the installer, the manual installation steps are as fol
     nix profile install "github:atuinsh/atuin"
     ```
 
-    Atuin is also available in [nixpkgs](https://github.com/NixOS/nixpkgs):
-
-    ```shell
-    nix-env -f '<nixpkgs>' -iA atuin
-    ```
+    Linux builds of `main` are cached on [Cachix](https://atuin.cachix.org). Run `cachix use atuin` first to download them instead of building from source.
 
 === "Pacman"
 
@@ -107,14 +112,6 @@ If you don't wish to use the installer, the manual installation steps are as fol
 
     ```shell
     pacman -S atuin
-    ```
-
-=== "XBPS"
-
-    Atuin is available in the Void Linux [repository](https://github.com/void-linux/void-packages/tree/master/srcpkgs/atuin):
-
-    ```shell
-    sudo xbps-install atuin
     ```
 
 === "Termux"
@@ -130,10 +127,10 @@ If you don't wish to use the installer, the manual installation steps are as fol
     Atuin is installable from github-releases directly:
 
     ```shell
-    # line 1: `atuin` binary as command, from github release, only look at .tar.gz files, use the `atuin` file from the extracted archive
+    # line 1: `atuin` binary as command, from github release, only look at .tar.gz files (excluding server), use the `atuin` file from the extracted archive
     # line 2: setup at clone(create init.zsh, completion)
     # line 3: pull behavior same as clone, source init.zsh
-    zinit ice as"command" from"gh-r" bpick"atuin-*.tar.gz" mv"atuin*/atuin -> atuin" \
+    zinit ice as"command" from"gh-r" bpick"atuin-*.tar.gz~*server*" mv"atuin*/atuin -> atuin" \
         atclone"./atuin init zsh > init.zsh; ./atuin gen-completions --shell zsh > _atuin" \
         atpull"%atclone" src"init.zsh"
     zinit light atuinsh/atuin
@@ -268,14 +265,14 @@ After installing, remember to restart your shell.
     Run in *Nushell*:
 
     ```shell
-    mkdir ~/.local/share/atuin/
-    atuin init nu | save ~/.local/share/atuin/init.nu
+    mkdir ~/.atuin/
+    atuin init nu | save ~/.atuin/init.nu
     ```
 
     Add to `config.nu`:
 
     ```shell
-    source ~/.local/share/atuin/init.nu
+    source ~/.atuin/init.nu
     ```
 
     ??? tip "Optional: Atuin pty-proxy"
@@ -284,16 +281,16 @@ After installing, remember to restart your shell.
         fullscreen. To use pty-proxy with Nushell, generate the init script:
 
         ```shell
-        mkdir ~/.local/share/atuin/
-        atuin pty-proxy init nu | save -f ~/.local/share/atuin/pty-proxy-init.nu
+        mkdir ~/.atuin/
+        atuin pty-proxy init nu | save -f ~/.atuin/pty-proxy-init.nu
         ```
 
         Then source it as early as possible in your `config.nu`, *before*
         the regular atuin init:
 
         ```shell
-        source ~/.local/share/atuin/pty-proxy-init.nu
-        source ~/.local/share/atuin/init.nu
+        source ~/.atuin/pty-proxy-init.nu
+        source ~/.atuin/init.nu
         ```
 
         Nushell's `source` command requires a static file path, so you must
@@ -318,6 +315,12 @@ After installing, remember to restart your shell.
 ## Upgrade
 
 Run `atuin update`, and if that command isn't available, run the install script again.
+
+If GitHub's API rate limit prevents the update, set `ATUIN_GITHUB_TOKEN` to a GitHub token. For example, if you use the GitHub CLI:
+
+```shell
+ATUIN_GITHUB_TOKEN="$(gh auth token)" atuin update
+```
 
 If you used a package manager to install Atuin, then you should also use your package manager to update Atuin.
 

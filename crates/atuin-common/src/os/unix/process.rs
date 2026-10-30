@@ -1,11 +1,20 @@
 //! Utilities for operating on processes.
 
+use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rustix::io::Errno;
 use rustix::process::{self, Pid, Signal};
+
+/// Try to convert a [`u32`] PID into a typed [`Pid`].
+///
+/// Standard library functions like [`std::process::id`] use [`u32`], but functions in this module
+/// expect [`Pid`].
+pub fn pid_from_u32(pid: u32) -> Option<Pid> {
+    i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw)
+}
 
 /// Gracefully terminate the process via `SIGTERM`.
 ///
@@ -83,6 +92,24 @@ pub fn cwd(pid: Pid) -> Option<PathBuf> {
     }
 }
 
+/// Get the file name of the executable a process is running.
+///
+/// This is the name the process was exec'd as, so a process that rewrites its `argv[0]` keeps it.
+#[must_use]
+pub fn name(pid: Pid) -> Option<OsString> {
+    let pid = sysinfo::Pid::from_u32(u32::try_from(pid.as_raw_pid()).ok()?);
+    let mut system = sysinfo::System::new();
+    if system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    ) == 0
+    {
+        return None;
+    }
+    Some(system.process(pid)?.name().to_owned())
+}
+
 /// Implementation of [`cwd`] that works on all Unix-like systems.
 ///
 /// Linux has a specific, more efficient implementation.
@@ -105,9 +132,10 @@ mod tests {
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};
 
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
 
     use super::*;
+    use crate::path::AbsPathBuf;
 
     /// Spawn a process that sits still in `dir`.
     fn sleeper(dir: &std::path::Path) -> (Child, Pid) {
@@ -138,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The temporary directory may sit behind a symlink (/tmp on macOS), and a working
         // directory never does.
-        let expected = dir.path().canonicalize().unwrap();
+        let expected = AbsPathBuf::canonicalize(dir.path()).unwrap();
         let (mut child, pid) = sleeper(dir.path());
 
         let found = settles_on(&expected, || cwd(pid));
@@ -153,7 +181,7 @@ mod tests {
         // Linux takes the /proc route, so without this the portable route would go untested
         // until it reached a platform that has no choice but to use it.
         let dir = tempfile::tempdir().unwrap();
-        let expected = dir.path().canonicalize().unwrap();
+        let expected = AbsPathBuf::canonicalize(dir.path()).unwrap();
         let (mut child, _) = sleeper(dir.path());
         let pid = child.id();
 
@@ -164,6 +192,29 @@ mod tests {
         assert_eq!(found.as_deref(), Some(expected.as_path()));
     }
 
+    /// A `sleep` running under another name, killed when dropped.
+    struct RenamedSleep(Child);
+
+    impl Drop for RenamedSleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[fixture]
+    fn renamed_sleep() -> RenamedSleep {
+        use std::os::unix::process::CommandExt;
+
+        RenamedSleep(Command::new("sleep").arg0("renamed").arg("30").spawn().unwrap())
+    }
+
+    #[rstest]
+    fn names_a_process_by_its_executable_rather_than_its_argv0(renamed_sleep: RenamedSleep) {
+        let pid = Pid::from_raw(renamed_sleep.0.id().cast_signed()).unwrap();
+        assert_eq!(name(pid).as_deref(), Some(std::ffi::OsStr::new("sleep")));
+    }
+
     #[rstest]
     fn a_process_that_has_gone_has_no_working_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -172,5 +223,15 @@ mod tests {
         child.wait().unwrap();
 
         assert_eq!(cwd(pid), None);
+    }
+
+    #[rstest]
+    #[case::zero(0, None)]
+    #[case::one(1, Some(1))]
+    #[case::max(i32::MAX.cast_unsigned(), Some(i32::MAX))]
+    #[case::just_over_max(i32::MAX.cast_unsigned() + 1, None)]
+    #[case::minus_one_if_wrapped(u32::MAX, None)]
+    fn test_pid_from_u32(#[case] pid: u32, #[case] expected: Option<i32>) {
+        assert_eq!(pid_from_u32(pid).map(Pid::as_raw_pid), expected);
     }
 }

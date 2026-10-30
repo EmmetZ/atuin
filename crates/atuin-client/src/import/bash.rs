@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::str;
 
 use async_trait::async_trait;
-use directories::UserDirs;
+use atuin_common::path::PathBufExt as _;
+use atuin_common::userio;
 use eyre::{Result, eyre};
 use itertools::Itertools;
 use time::{Duration, OffsetDateTime};
@@ -17,10 +18,9 @@ pub struct Bash {
 }
 
 fn default_histpath() -> Result<PathBuf> {
-    let user_dirs = UserDirs::new().ok_or_else(|| eyre!("could not find user directories"))?;
-    let home_dir = user_dirs.home_dir();
+    let home_dir = dirs::home_dir().ok_or_else(|| eyre!("could not find home directory"))?;
 
-    Ok(home_dir.join(".bash_history"))
+    Ok(home_dir.joined(".bash_history"))
 }
 
 #[async_trait]
@@ -76,10 +76,7 @@ impl Importer for Bash {
                 LineType::Empty => {}                // do nothing
                 LineType::Timestamp(t) => {
                     if t < next_timestamp {
-                        warn!(
-                            "Time reversal detected in Bash history! Commands may be ordered \
-                             incorrectly."
-                        );
+                        userio::log::warn!("import-bash-time-reversal");
                     }
                     next_timestamp = t;
                 }

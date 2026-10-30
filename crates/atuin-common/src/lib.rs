@@ -4,12 +4,21 @@
 pub mod ansi;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod dirs;
 pub mod docs;
 pub mod encryption;
+pub mod env;
 pub mod filter;
 pub mod fs;
 pub mod futures;
+#[cfg(feature = "ai")]
+pub mod harnesstools;
+pub mod i18n;
+#[cfg(feature = "io")]
+pub mod io;
+pub mod json;
 pub mod logs;
+pub mod num;
 #[cfg(feature = "os")]
 pub mod os;
 pub mod path;
@@ -25,4 +34,5 @@ pub mod test_utils;
 pub mod time;
 pub mod units;
 pub mod url;
+pub mod userio;
 pub mod utils;

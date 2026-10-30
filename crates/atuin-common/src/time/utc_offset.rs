@@ -7,7 +7,8 @@ use serde_with::DeserializeFromStr;
 use time::UtcOffset;
 use time::format_description::FormatItem;
 use time::macros::format_description;
-use tracing::warn;
+
+use crate::userio;
 
 /// Extensions to [`UtcOffset`].
 pub trait UtcOffsetExt {
@@ -27,7 +28,7 @@ pub trait UtcOffsetExt {
 impl UtcOffsetExt for UtcOffset {
     fn local_or_utc() -> UtcOffset {
         Self::current_local_offset().unwrap_or_else(|e| {
-            warn!("could not determine local UTC offset, falling back to UTC: {e}");
+            userio::log::warn!("time-local-offset-unknown", error = e.to_string());
             Self::UTC
         })
     }
@@ -79,6 +80,12 @@ impl FromStr for UtcOffsetSpec {
     }
 }
 
+impl Default for UtcOffsetSpec {
+    fn default() -> Self {
+        Self(UtcOffset::UTC)
+    }
+}
+
 /// format: `<+|-><hour>[:<minute>[:<second>]]`
 static OFFSET_FMT: &[FormatItem<'_>] = format_description!(
     "[offset_hour sign:mandatory padding:none][optional [:[offset_minute padding:none][optional \
@@ -107,7 +114,7 @@ mod tests {
         assert!(UtcOffsetSpec::from_str(spec).is_err());
     }
 
-    #[test]
+    #[rstest]
     fn spec_wraps_the_resolved_offset() {
         let spec = UtcOffsetSpec::from_str("+09:30").unwrap();
         assert_eq!(spec.0.as_hms(), (9, 30, 0));
@@ -133,14 +140,14 @@ mod tests {
         assert_eq!(UtcOffset::resolve_spec(spec).unwrap().as_hms(), (h, m, s));
     }
 
-    #[test]
+    #[rstest]
     fn resolve_spec_accepts_anything_stringlike() {
         // the point of `impl AsRef<str>`: borrowed or owned, no dance at the call site
         assert!(UtcOffset::resolve_spec("utc").is_ok());
         assert!(UtcOffset::resolve_spec(String::from("utc")).is_ok());
     }
 
-    #[test]
+    #[rstest]
     fn resolve_spec_local_queries_the_system() {
         // cannot assert the value -- it depends on the machine -- but it must resolve
         assert!(UtcOffset::resolve_spec("local").is_ok());

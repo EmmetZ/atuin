@@ -1,42 +1,68 @@
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use atuin_client::database::Sqlite;
 use atuin_client::record::sqlite_store::SqliteStore;
-use atuin_client::record::sync::{ClientSource, Operation, SyncEngine};
+use atuin_client::record::sync::{ClientSource, Operation, SyncSession};
 use atuin_client::settings::Settings;
 use atuin_common::encryption::paseto_v4;
+use atuin_common::userio;
 use atuin_domain::record::RecordTag;
 use clap::Args;
 use eyre::{Context as _, Result};
 
+use crate::i18n::fl;
+
 #[derive(Args, Debug)]
 pub struct Pull {
-    /// The tag to push (eg, 'history'). Defaults to all tags
-    #[arg(long, short)]
+    #[arg(long, short, help = fl!("arg-store-tag"))]
     pub tag: Option<RecordTag>,
 
-    /// Force push records
-    ///
-    /// This will first wipe the local store, and then download all records from the remote
-    #[arg(long, default_value = "false")]
+    #[arg(
+        long,
+        default_value = "false",
+        help = fl!("arg-store-pull-force"),
+        long_help = fl!("arg-store-pull-force", "long")
+    )]
     pub force: bool,
 
-    /// Page Size
-    ///
-    /// How many records to download at once. Defaults to 100
-    #[arg(long, default_value = "100")]
+    #[arg(
+        long,
+        default_value = "100",
+        help = fl!("arg-store-pull-page"),
+        long_help = fl!("arg-store-pull-page", "long")
+    )]
     pub page: NonZeroU64,
 }
 
 impl Pull {
-    pub async fn run(&self, settings: &Settings, store: SqliteStore, db: &Sqlite) -> Result<()> {
-        if self.force {
-            println!("Forcing local overwrite!");
-            println!("Clearing local store");
-
-            store.delete_all().await?;
+    pub async fn run(
+        &self,
+        settings: &Arc<Settings>,
+        store: SqliteStore,
+        db: &Sqlite,
+    ) -> Result<()> {
+        if !self.force {
+            return self.pull(settings, store, db).await;
         }
 
+        userio::log::info!("store-pull-force");
+        userio::log::info!("store-pull-clear");
+        store.delete_all().await?;
+        let pulled = self.pull(settings, store, db).await;
+        // Records only this machine had are gone, and the threads index must forget what
+        // they projected: rebuilt from what the store holds now, however far the pull got.
+        let reset = super::reset_ai_sessions_after(settings).await;
+        match (pulled, reset) {
+            (Err(pull), Err(reset)) => {
+                userio::log::error!("store-pull-reset-failed", error = format!("{reset:#}"));
+                Err(pull)
+            }
+            (pulled, reset) => pulled.and(reset),
+        }
+    }
+
+    async fn pull(&self, settings: &Arc<Settings>, store: SqliteStore, db: &Sqlite) -> Result<()> {
         // We can actually just use the existing diff/etc to push
         // 1. Diff
         // 2. Get operations
@@ -45,7 +71,7 @@ impl Pull {
         //  b) are they for the host/tag we are pushing here?
         let key = paseto_v4::Key::try_load_from_path(&settings.key_path)
             .context("could not load encryption key")?;
-        let engine = SyncEngine::builder()
+        let session = SyncSession::builder()
             .store(store.clone())
             .client_source(ClientSource::FromSettings {
                 settings,
@@ -56,17 +82,17 @@ impl Pull {
             .await?
             .with_page_size(self.page);
 
-        let keyed = engine.keyed(&key);
-        let (diff, remote_index) = engine.diff().await?;
+        let keyed = session.keyed(&key);
+        let (diff, remote_index) = session.diff().await?;
 
         // Skip on --force: local was already wiped above, mismatch is the user's call.
         if !self.force
             && let Some(err) = keyed.key_valid_against(&remote_index).await
         {
-            return Err(crate::print_error::format_sync_error(err));
+            return Err(err.into());
         }
 
-        let operations = SyncEngine::operations(diff)?;
+        let operations = SyncSession::operations(diff)?;
 
         let operations = operations
             .into_iter()
@@ -93,9 +119,14 @@ impl Pull {
 
         let (_, downloaded) = keyed.sync_remote(operations).await?;
 
-        println!("Downloaded {} records", downloaded.len());
+        userio::log::info!("store-pull-downloaded", count = downloaded.len());
 
-        crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
+        // On --force the daemon rebuilds the AI sessions from scratch after this.
+        if self.force {
+            crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
+        } else {
+            crate::command::client::sync::build(settings, &store, db, &downloaded).await?;
+        }
 
         Ok(())
     }

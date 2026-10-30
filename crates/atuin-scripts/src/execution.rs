@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 
+use atuin_common::userio;
 use eyre::Result;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +17,7 @@ pub fn build_executable_script(script: &str, shebang: &str) -> String {
     if shebang.is_empty() {
         // Default to bash if no shebang is provided
         format!("#!/usr/bin/env bash\n{script}")
-    } else if script.starts_with("#!") {
+    } else if shebang.starts_with("#!") {
         format!("{shebang}\n{script}")
     } else {
         format!("#!{shebang}\n{script}")
@@ -169,11 +170,11 @@ pub async fn execute_script_interactive(
     tokio::spawn(async move {
         while let Some(input) = stdin_rx.recv().await {
             if let Err(e) = stdin.write_all(input.as_bytes()).await {
-                eprintln!("Error writing to stdin: {e}");
+                userio::log::error!("scripts-stdin-write-failed", error = e.to_string());
                 break;
             }
             if let Err(e) = stdin.flush().await {
-                eprintln!("Error flushing stdin: {e}");
+                userio::log::error!("scripts-stdin-flush-failed", error = e.to_string());
                 break;
             }
         }
@@ -192,16 +193,16 @@ pub async fn execute_script_interactive(
                 Ok(0) => break, // End of stdout
                 Ok(n) => {
                     if let Err(e) = stdout_writer.write_all(&buffer[0..n]).await {
-                        eprintln!("Error writing to stdout: {e}");
+                        userio::log::error!("scripts-stdout-write-failed", error = e.to_string());
                         break;
                     }
                     if let Err(e) = stdout_writer.flush().await {
-                        eprintln!("Error flushing stdout: {e}");
+                        userio::log::error!("scripts-stdout-flush-failed", error = e.to_string());
                         break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from process stdout: {e}");
+                    userio::log::error!("scripts-stdout-read-failed", error = e.to_string());
                     break;
                 }
             }
@@ -220,16 +221,16 @@ pub async fn execute_script_interactive(
                 Ok(0) => break, // End of stderr
                 Ok(n) => {
                     if let Err(e) = stderr_writer.write_all(&buffer[0..n]).await {
-                        eprintln!("Error writing to stderr: {e}");
+                        userio::log::error!("scripts-stderr-write-failed", error = e.to_string());
                         break;
                     }
                     if let Err(e) = stderr_writer.flush().await {
-                        eprintln!("Error flushing stderr: {e}");
+                        userio::log::error!("scripts-stderr-flush-failed", error = e.to_string());
                         break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from process stderr: {e}");
+                    userio::log::error!("scripts-stderr-read-failed", error = e.to_string());
                     break;
                 }
             }
@@ -249,7 +250,7 @@ pub async fn execute_script_interactive(
                 status
             }
             Err(e) => {
-                eprintln!("Error waiting for child process: {e}");
+                userio::log::error!("scripts-wait-failed", error = e.to_string());
                 // Send a default error code
                 let _ = exit_code_tx.send(-1).await;
                 return;
@@ -258,11 +259,11 @@ pub async fn execute_script_interactive(
 
         // Wait for stdout/stderr tasks to complete
         if let Err(e) = stdout_handle.await {
-            eprintln!("Error joining stdout task: {e}");
+            userio::log::error!("scripts-stdout-join-failed", error = e.to_string());
         }
 
         if let Err(e) = stderr_handle.await {
-            eprintln!("Error joining stderr task: {e}");
+            userio::log::error!("scripts-stderr-join-failed", error = e.to_string());
         }
 
         // Send the exit code
@@ -276,4 +277,26 @@ pub async fn execute_script_interactive(
         stdin_tx,
         exit_code_rx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::build_executable_script;
+
+    #[rstest]
+    #[case::default_bash("", "#!/usr/bin/env bash")]
+    #[case::bare_interpreter("/usr/bin/env python3", "#!/usr/bin/env python3")]
+    #[case::prefixed_interpreter("#!/usr/bin/env python3", "#!/usr/bin/env python3")]
+    fn builds_executable_script(
+        #[case] shebang: &str,
+        #[case] expected_shebang: &str,
+        #[values("print(1 + 1)\n", "#!/usr/bin/env python3\nprint(1 + 1)\n")] script: &str,
+    ) {
+        assert_eq!(
+            build_executable_script(script, shebang),
+            format!("{expected_shebang}\n{script}")
+        );
+    }
 }

@@ -1,11 +1,18 @@
 //! Unix-specific utilities.
 
-pub mod process;
-pub mod tty;
-
 use std::path::{Path, PathBuf};
 
 use rustix::fs;
+
+use crate::path::AbsPathBuf;
+
+pub mod disk;
+pub mod io;
+pub mod process;
+pub mod tty;
+
+mod socket;
+pub use socket::socket_in_use;
 
 /// Get the current UID.
 #[must_use]
@@ -33,11 +40,13 @@ pub fn touch_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Get the global temporary directory.
-pub fn tmp_dir() -> PathBuf {
+/// Get the global temporary directory: `$TMPDIR`, or `/tmp` if that is unset or relative.
+#[must_use]
+pub fn tmp_dir() -> AbsPathBuf {
     // TODO: We should perhaps use `std::env::temp_dir()` instead, but that would be a breaking
     // change and could cause clients to fail to connect to an older running daemon.
-    crate::utils::env_nonempty("TMPDIR").map_or_else(|| "/tmp".into(), Into::into)
+    crate::env::var_abspath("TMPDIR")
+        .unwrap_or_else(|| AbsPathBuf::new("/tmp").expect("/tmp is absolute"))
 }
 
 /// Error returned by [`create_secure_temp_dir`].
@@ -127,6 +136,8 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, symlink};
     use std::os::unix::net::UnixListener;
 
+    use rstest::rstest;
+
     use super::*;
 
     /// Set a file's timestamp to the Unix epoch.
@@ -148,7 +159,7 @@ mod tests {
         assert_eq!(fs_err::symlink_metadata(path).unwrap().mtime(), 0);
     }
 
-    #[test]
+    #[rstest]
     fn touching_a_socket_refreshes_its_timestamps() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("atuin.sock");
@@ -158,7 +169,7 @@ mod tests {
         assert!(fs_err::symlink_metadata(&path).unwrap().mtime() > 0);
     }
 
-    #[test]
+    #[rstest]
     fn touching_a_symlink_leaves_its_target_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let (target, link) = (tmp.path().join("target"), tmp.path().join("link"));

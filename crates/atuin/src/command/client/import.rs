@@ -1,5 +1,3 @@
-use std::env;
-
 use async_trait::async_trait;
 use atuin_client::database::Sqlite;
 use atuin_client::history::History;
@@ -15,39 +13,42 @@ use atuin_client::import::xonsh_sqlite::XonshSqlite;
 use atuin_client::import::zsh::Zsh;
 use atuin_client::import::zsh_histdb::ZshHistDb;
 use atuin_client::import::{Importer, Loader};
+use atuin_common::{env, userio};
 use clap::Parser;
 use easy_cast::Conv;
 use eyre::Result;
 use indicatif::ProgressBar;
 use tracing::instrument;
 
+use crate::i18n::fl;
+
 #[derive(Parser, Debug)]
 #[command(infer_subcommands = true)]
 pub enum Cmd {
-    /// Import history for the current shell
+    #[command(about = fl!("cmd-import-auto"))]
     Auto,
 
-    /// Import history from the zsh history file
+    #[command(about = fl!("cmd-import-shell", shell = "zsh"))]
     Zsh,
-    /// Import history from the zsh history file
+    #[command(about = fl!("cmd-import-zsh-hist-db"))]
     ZshHistDb,
-    /// Import history from the bash history file
+    #[command(about = fl!("cmd-import-shell", shell = "bash"))]
     Bash,
-    /// Import history from the replxx history file
+    #[command(about = fl!("cmd-import-shell", shell = "replxx"))]
     Replxx,
-    /// Import history from the resh history file
+    #[command(about = fl!("cmd-import-shell", shell = "resh"))]
     Resh,
-    /// Import history from the fish history file
+    #[command(about = fl!("cmd-import-shell", shell = "fish"))]
     Fish,
-    /// Import history from the nu history file
+    #[command(about = fl!("cmd-import-shell", shell = "nu"))]
     Nu,
-    /// Import history from the nu history file
+    #[command(about = fl!("cmd-import-nu-hist-db"))]
     NuHistDb,
-    /// Import history from xonsh json files
+    #[command(about = fl!("cmd-import-xonsh"))]
     Xonsh,
-    /// Import history from xonsh sqlite db
+    #[command(about = fl!("cmd-import-xonsh-sqlite"))]
     XonshSqlite,
-    /// Import history from the powershell history file
+    #[command(about = fl!("cmd-import-shell", shell = "powershell"))]
     Powershell,
 }
 
@@ -57,24 +58,19 @@ impl Cmd {
     #[allow(clippy::cognitive_complexity)]
     #[instrument(level = "trace", skip_all, err)]
     pub async fn run(&self, db: &Sqlite) -> Result<()> {
-        println!("        Atuin         ");
-        println!("======================");
-        println!("          \u{1f30d}          ");
-        println!("       \u{1f418}\u{1f418}\u{1f418}\u{1f418}       ");
-        println!("          \u{1f422}          ");
-        println!("======================");
-        println!("Importing history...");
+        userio::log::info!("import-banner");
+        userio::log::info!("import-start");
 
         match self {
             Self::Auto => {
                 if cfg!(windows) {
                     return if env::var("PSModulePath").is_ok() {
-                        println!("Detected PowerShell");
+                        userio::log::info!("import-detected-powershell");
                         import::<PowerShell>(db).await
                     } else {
-                        println!("Could not detect the current shell.");
-                        println!("Please run atuin import <SHELL>.");
-                        println!("To view a list of shells, run atuin import.");
+                        userio::log::error!("import-detect-shell-failed");
+                        userio::log::info!("import-run-with-shell");
+                        userio::log::info!("import-list-shells");
                         Ok(())
                     };
                 }
@@ -85,38 +81,44 @@ impl Cmd {
                 let shell = env::var("SHELL").unwrap_or_else(|_| String::from("NO_SHELL"));
 
                 if xonsh_histfile.to_lowercase().ends_with(".json") {
-                    println!("Detected Xonsh");
+                    userio::log::info!("import-detected-xonsh");
                     import::<Xonsh>(db).await
                 } else if xonsh_histfile.to_lowercase().ends_with(".sqlite") {
-                    println!("Detected Xonsh (SQLite backend)");
+                    userio::log::info!("import-detected-xonsh-sqlite");
                     import::<XonshSqlite>(db).await
                 } else if shell.ends_with("/zsh") {
                     if let Ok(path) = ZshHistDb::histpath() {
-                        println!("Detected Zsh-HistDb, using :{}", path.to_string_lossy());
+                        userio::log::info!(
+                            "import-detected-zsh-histdb",
+                            path = path.display().to_string()
+                        );
                         import::<ZshHistDb>(db).await
                     } else {
-                        println!("Detected ZSH");
+                        userio::log::info!("import-detected-zsh");
                         import::<Zsh>(db).await
                     }
                 } else if shell.ends_with("/fish") {
-                    println!("Detected Fish");
+                    userio::log::info!("import-detected-fish");
                     import::<Fish>(db).await
                 } else if shell.ends_with("/bash") {
-                    println!("Detected Bash");
+                    userio::log::info!("import-detected-bash");
                     import::<Bash>(db).await
                 } else if shell.ends_with("/nu") {
                     if let Ok(path) = NuHistDb::histpath() {
-                        println!("Detected Nu-HistDb, using :{}", path.to_string_lossy());
+                        userio::log::info!(
+                            "import-detected-nu-histdb",
+                            path = path.display().to_string()
+                        );
                         import::<NuHistDb>(db).await
                     } else {
-                        println!("Detected Nushell");
+                        userio::log::info!("import-detected-nushell");
                         import::<Nu>(db).await
                     }
                 } else if shell.ends_with("/pwsh") {
-                    println!("Detected PowerShell");
+                    userio::log::info!("import-detected-powershell");
                     import::<PowerShell>(db).await
                 } else {
-                    println!("cannot import {shell} history");
+                    userio::log::error!("import-shell-unsupported", shell = shell.as_str());
                     Ok(())
                 }
             }
@@ -172,7 +174,7 @@ impl Loader for HistoryImporter<'_> {
 }
 
 async fn import<I: Importer + Send>(db: &Sqlite) -> Result<()> {
-    println!("Importing history from {}", I::NAME);
+    userio::log::info!("import-from", name = I::NAME);
 
     let mut importer = I::new().await?;
     let len = importer.entries().await?;
@@ -180,6 +182,6 @@ async fn import<I: Importer + Send>(db: &Sqlite) -> Result<()> {
     importer.load(&mut loader).await?;
     loader.flush().await?;
 
-    println!("Import complete!");
+    userio::log::info!("import-complete");
     Ok(())
 }

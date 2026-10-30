@@ -3,8 +3,7 @@ use atuin_client::history::store::HistoryStore;
 use atuin_client::record::sqlite_store::SqliteStore;
 use atuin_client::settings::Settings;
 use atuin_common::encryption::paseto_v4;
-use atuin_dotfiles::store::AliasStore;
-use atuin_dotfiles::store::var::VarStore;
+use atuin_common::userio;
 use atuin_scripts::store::ScriptStore;
 use clap::Args;
 use eyre::{Context as _, Result, bail};
@@ -33,12 +32,14 @@ impl Rebuild {
                 self.rebuild_history(settings, store.clone(), database).await?;
             }
 
-            "dotfiles" => {
-                self.rebuild_dotfiles(settings, store.clone()).await?;
-            }
-
             "scripts" => {
                 self.rebuild_scripts(settings, store.clone()).await?;
+            }
+
+            // The daemon owns the sidecar, and rebuilds it. `ai-session` is the threads' record tag.
+            "threads" | "ai-session" => {
+                super::reset_ai_sessions(settings).await?;
+                userio::log::info!("store-rebuild-threads");
             }
 
             tag => {
@@ -65,7 +66,7 @@ impl Rebuild {
         let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
             .context("could not load encryption key")?;
 
-        let host_id = Settings::host_id().await?;
+        let host_id = settings.host_id().await?;
         let history_store = HistoryStore::new(store, host_id, encryption_key);
 
         history_store.build(database).await?;
@@ -73,25 +74,10 @@ impl Rebuild {
         Ok(())
     }
 
-    async fn rebuild_dotfiles(&self, settings: &Settings, store: SqliteStore) -> Result<()> {
-        let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
-            .context("could not load encryption key")?;
-
-        let host_id = Settings::host_id().await?;
-
-        let alias_store = AliasStore::new(store.clone(), host_id, encryption_key.clone());
-        let var_store = VarStore::new(store.clone(), host_id, encryption_key);
-
-        alias_store.build().await?;
-        var_store.build().await?;
-
-        Ok(())
-    }
-
     async fn rebuild_scripts(&self, settings: &Settings, store: SqliteStore) -> Result<()> {
         let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
             .context("could not load encryption key")?;
-        let host_id = Settings::host_id().await?;
+        let host_id = settings.host_id().await?;
         let script_store = ScriptStore::new(store, host_id, encryption_key);
         let database = atuin_scripts::database::Database::new(
             settings.scripts.db_path.clone(),
@@ -99,7 +85,7 @@ impl Rebuild {
         )
         .await?;
 
-        script_store.build(database).await?;
+        script_store.build(&database).await?;
 
         Ok(())
     }

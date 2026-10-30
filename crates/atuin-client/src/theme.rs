@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::error;
 use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use atuin_common::path::PathBufExt as _;
+use atuin_common::userio;
 use config::{Config, File as ConfigFile, FileFormat};
 use palette::named;
 use serde::{Deserialize, Serialize};
-use serde_json;
-use strum_macros;
 
 static DEFAULT_MAX_DEPTH: u8 = 10;
 
@@ -154,9 +153,11 @@ impl Theme {
                     *name,
                     StyleFactory::from_fg_string(color).unwrap_or_else(|err| {
                         if debug {
-                            tracing::warn!(
-                                "Tried to load string as a color unsuccessfully: ({name}={color}) \
-                                 {err}"
+                            userio::log::warn!(
+                                "theme-color-invalid",
+                                name = name.to_string(),
+                                color = color,
+                                error = err
                             );
                         }
                         ContentStyle::default()
@@ -264,7 +265,7 @@ impl StyleFactory {
 
 // Built-in themes. Rather than having extra files added before any theming
 // is available, this gives a couple of basic options, demonstrating the use
-// of themes: autumn and marine
+// of themes: autumn, marine and pumpkin
 static ALERT_TYPES: LazyLock<HashMap<tracing::Level, Meaning>> = LazyLock::new(|| {
     HashMap::from([
         (tracing::Level::INFO, Meaning::AlertInfo),
@@ -350,6 +351,32 @@ static BUILTIN_THEMES: LazyLock<HashMap<&'static str, Theme>> = LazyLock::new(||
                 (Meaning::Guidance, StyleFactory::known_fg_string("teal")),
             ]),
         ),
+        ("pumpkin", {
+            // Colors from the Dracula palette (MIT). Base stays unset so the theme reads on light
+            // terminals too.
+            const ORANGE: &str = "#ffb86c";
+            const PURPLE: &str = "#bd93f9";
+            const GREEN: &str = "#50fa7b";
+            const RED: &str = "#ff5555";
+            const PINK: &str = "#ff79c6";
+            const COMMENT: &str = "#6272a4";
+            HashMap::from([
+                (Meaning::AlertError, StyleFactory::known_fg_string(RED)),
+                (Meaning::AlertWarn, StyleFactory::known_fg_string(ORANGE)),
+                (Meaning::AlertInfo, StyleFactory::known_fg_string(GREEN)),
+                (Meaning::Annotation, StyleFactory::known_fg_string(COMMENT)),
+                (Meaning::Guidance, StyleFactory::known_fg_string(PURPLE)),
+                (Meaning::Important, ContentStyle {
+                    attributes: Attributes::from(Attribute::Bold),
+                    ..StyleFactory::known_fg_string(ORANGE)
+                }),
+                (Meaning::SyntaxCommand, StyleFactory::known_fg_string(ORANGE)),
+                (Meaning::SyntaxFlag, StyleFactory::known_fg_string(PURPLE)),
+                (Meaning::SyntaxString, StyleFactory::known_fg_string(GREEN)),
+                (Meaning::SyntaxVariable, StyleFactory::known_fg_string(PINK)),
+                (Meaning::SyntaxComment, StyleFactory::known_fg_string(COMMENT)),
+            ])
+        }),
         (
             // This is the default theme with default PowerShell syntax highlighting colors.
             "default-powershell",
@@ -368,57 +395,63 @@ static BUILTIN_THEMES: LazyLock<HashMap<&'static str, Theme>> = LazyLock::new(||
     .collect()
 });
 
+/// Options for building a [`ThemeManager`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThemeManagerOptions {
+    /// Show more detail about issues in theme files.
+    pub debug: bool,
+    /// Only load built-in themes, rather than reading the user's theme directory.
+    pub builtin_only: bool,
+}
+
+impl ThemeManagerOptions {
+    #[must_use]
+    pub fn from_settings(settings: &crate::settings::Theme) -> Self {
+        Self {
+            debug: settings.debug.unwrap_or(false),
+            builtin_only: false,
+        }
+    }
+
+    #[must_use]
+    pub fn build(self) -> ThemeManager {
+        ThemeManager {
+            loaded_themes: HashMap::new(),
+            debug: self.debug,
+            builtin_only: self.builtin_only,
+        }
+    }
+}
+
 // To avoid themes being repeatedly loaded, we store them in a theme manager
 pub struct ThemeManager {
     loaded_themes: HashMap<String, Theme>,
     debug: bool,
-    override_theme_dir: Option<String>,
+    builtin_only: bool,
 }
 
 // Theme-loading logic
 impl ThemeManager {
     #[must_use]
-    pub fn new(debug: Option<bool>, theme_dir: Option<String>) -> Self {
-        Self {
-            loaded_themes: HashMap::new(),
-            debug: debug.unwrap_or(false),
-            override_theme_dir: match theme_dir {
-                Some(theme_dir) => Some(theme_dir),
-                None => std::env::var("ATUIN_THEME_DIR").ok(),
-            },
-        }
+    pub fn from_settings(settings: &crate::settings::Theme) -> Self {
+        ThemeManagerOptions::from_settings(settings).build()
     }
 
-    // Try to load a theme from a `{name}.toml` file in the theme directory. If an override is set
-    // for the theme dir (via ATUIN_THEME_DIR env) we should load the theme from there
-    pub fn load_theme_from_file(
+    // Try to load a theme from a `{name}.toml` file in the themes directory (unless
+    // `Self::builtin_only` is true)
+    fn load_theme_from_file(
         &mut self,
         name: &str,
         max_depth: u8,
     ) -> Result<&Theme, Box<dyn error::Error>> {
-        let mut theme_file = if let Some(p) = &self.override_theme_dir {
-            if p.is_empty() {
-                return Err(Box::new(Error::new(
-                    ErrorKind::NotFound,
-                    "Empty theme directory override and could not find theme elsewhere",
-                )));
-            }
-            PathBuf::from(p)
-        } else {
-            let config_dir = atuin_common::utils::config_dir();
-            let mut theme_file = if let Ok(p) = std::env::var("ATUIN_CONFIG_DIR") {
-                PathBuf::from(p)
-            } else {
-                let mut theme_file = PathBuf::new();
-                theme_file.push(config_dir);
-                theme_file
-            };
-            theme_file.push("themes");
-            theme_file
-        };
+        if self.builtin_only {
+            return Err(Box::new(Error::new(
+                ErrorKind::NotFound,
+                "cannot load theme file: only built-in themes are enabled",
+            )));
+        }
 
-        let theme_toml = format!["{name}.toml"];
-        theme_file.push(theme_toml);
+        let theme_file = atuin_common::dirs::config_path("themes").joined(format!("{name}.toml"));
 
         let mut config_builder = Config::builder();
 
@@ -467,10 +500,10 @@ impl ThemeManager {
         };
 
         if debug && name != theme_config.theme.name {
-            tracing::warn!(
-                "Your theme config name is not the name of your loaded theme {} != {}",
-                name,
-                theme_config.theme.name
+            userio::log::warn!(
+                "theme-name-mismatch",
+                name = name,
+                config_name = theme_config.theme.name.as_str()
             );
         }
 
@@ -494,7 +527,7 @@ impl ThemeManager {
             None => match self.load_theme_from_file(name, max_depth.unwrap_or(DEFAULT_MAX_DEPTH)) {
                 Ok(theme) => theme,
                 Err(err) => {
-                    tracing::warn!("Could not load theme {name}: {err}");
+                    userio::log::warn!("theme-load-failed", name = name, error = err.to_string());
                     built_ins.get("(none)").unwrap()
                 }
             },
@@ -511,7 +544,11 @@ mod theme_tests {
 
     #[fixture]
     fn manager(#[default(false)] debug: bool) -> ThemeManager {
-        ThemeManager::new(Some(debug), Some("".to_string()))
+        ThemeManagerOptions {
+            debug,
+            builtin_only: true,
+        }
+        .build()
     }
 
     fn theme_config(toml: &str) -> Config {
@@ -519,9 +556,16 @@ mod theme_tests {
     }
 
     #[rstest]
-    fn test_can_load_builtin_theme(mut manager: ThemeManager) {
-        let theme = manager.load_theme("autumn", None);
-        assert_eq!(theme.as_style(Meaning::Guidance).foreground_color, from_string("brown").ok());
+    #[case::autumn("autumn", Meaning::Guidance, "brown")]
+    #[case::pumpkin("pumpkin", Meaning::Important, "#ffb86c")]
+    fn test_can_load_builtin_theme(
+        mut manager: ThemeManager,
+        #[case] name: &str,
+        #[case] meaning: Meaning,
+        #[case] color: &str,
+    ) {
+        let theme = manager.load_theme(name, None);
+        assert_eq!(theme.as_style(meaning).foreground_color, from_string(color).ok());
     }
 
     #[rstest]
@@ -590,7 +634,7 @@ mod theme_tests {
         assert_eq!(title_theme.as_style(Meaning::Title).foreground_color, Some(Color::White));
     }
 
-    #[test]
+    #[rstest]
     fn test_no_fallbacks_are_circular() {
         let mytheme = Theme::new("mytheme".to_string(), None, HashMap::from([]));
         MEANING_FALLBACKS
@@ -682,8 +726,8 @@ mod theme_tests {
         assert_eq!(captured_logs.len(), 1);
         assert_eq!(
             captured_logs[0].message,
-            "Could not load theme nonsolarized: Empty theme directory override and could not find \
-             theme elsewhere"
+            "could not load theme nonsolarized: cannot load theme file: only built-in themes are \
+             enabled"
         );
         assert_eq!(captured_logs[0].level, tracing::Level::WARN);
     }
@@ -692,7 +736,11 @@ mod theme_tests {
     fn debug_theme_logs(#[values(true, false)] debug: bool) {
         let logs = capture_logs();
 
-        let mut manager = ThemeManager::new(Some(debug), Some("".to_string()));
+        let mut manager = ThemeManagerOptions {
+            debug,
+            builtin_only: true,
+        }
+        .build();
         let config = theme_config(
             "
         [theme]
@@ -709,13 +757,13 @@ mod theme_tests {
             assert_eq!(captured_logs.len(), 2);
             assert_eq!(
                 captured_logs[0].message,
-                "Your theme config name is not the name of your loaded theme config_theme != \
+                "your theme config name is not the name of your loaded theme config_theme != \
                  mytheme"
             );
             assert_eq!(captured_logs[0].level, tracing::Level::WARN);
             assert_eq!(
                 captured_logs[1].message,
-                "Tried to load string as a color unsuccessfully: (AlertInfo=xinetic) No such \
+                "tried to load string as a color unsuccessfully: (AlertInfo=xinetic) No such \
                  color in palette"
             );
             assert_eq!(captured_logs[1].level, tracing::Level::WARN);

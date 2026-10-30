@@ -6,6 +6,7 @@ use atuin_client::database::Sqlite;
 use atuin_client::record::sqlite_store::SqliteStore;
 use atuin_client::settings::Settings;
 use atuin_common::encryption::paseto_v4;
+use atuin_common::userio;
 use atuin_scripts::execution::{
     build_executable_script, execute_script_interactive, template_script, template_variables,
 };
@@ -15,6 +16,8 @@ use clap::{Parser, Subcommand};
 use eyre::{Context as _, OptionExt, Result, bail};
 use tempfile::NamedTempFile;
 use tracing::{debug, instrument};
+
+use crate::i18n::fl;
 
 #[derive(Parser, Debug)]
 pub struct NewScript {
@@ -34,13 +37,11 @@ pub struct NewScript {
 
     #[allow(clippy::option_option)]
     #[arg(long)]
-    /// Use the last command as the script content
-    ///
-    /// Optionally specify a number to use the last N commands
+    #[arg(help = fl!("arg-scripts-new-last"), long_help = fl!("arg-scripts-new-last", "long"))]
     pub last: Option<Option<usize>>,
 
     #[arg(long)]
-    /// Skip opening editor when using --last
+    #[arg(help = fl!("arg-scripts-new-no-edit"))]
     pub no_edit: bool,
 }
 
@@ -48,10 +49,12 @@ pub struct NewScript {
 pub struct Run {
     pub name: String,
 
-    /// Specify template variables in the format KEY=VALUE
-    ///
-    /// Example: -v name=John -v greeting="Hello there"
-    #[arg(short, long = "var")]
+    #[arg(
+        short,
+        long = "var",
+        help = fl!("arg-scripts-run-var"),
+        long_help = fl!("arg-scripts-run-var", "long")
+    )]
     pub var: Vec<String>,
 }
 
@@ -63,7 +66,7 @@ pub struct Get {
     pub name: String,
 
     #[arg(short, long)]
-    /// Display only the executable script with shebang
+    #[arg(help = fl!("arg-scripts-get-script"))]
     pub script: bool,
 }
 
@@ -74,16 +77,13 @@ pub struct Edit {
     #[arg(short, long)]
     pub description: Option<String>,
 
-    /// Replace all existing tags with these new tags
-    #[arg(short, long)]
+    #[arg(short, long, help = fl!("arg-scripts-edit-tags"))]
     pub tags: Vec<String>,
 
-    /// Remove all tags from the script
-    #[arg(long)]
+    #[arg(long, help = fl!("arg-scripts-edit-no-tags"))]
     pub no_tags: bool,
 
-    /// Rename the script
-    #[arg(long)]
+    #[arg(long, help = fl!("arg-scripts-edit-rename"))]
     pub rename: Option<String>,
 
     #[arg(short, long)]
@@ -93,8 +93,7 @@ pub struct Edit {
     pub script: Option<PathBuf>,
 
     #[allow(clippy::struct_field_names)]
-    /// Skip opening editor
-    #[arg(long)]
+    #[arg(long, help = fl!("arg-scripts-edit-no-edit"))]
     pub no_edit: bool,
 }
 
@@ -133,15 +132,19 @@ impl Cmd {
         }
 
         // Open the file in the user's preferred editor
-        let editor_str = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let editor_str = atuin_common::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
         // Use shlex to safely split the string into shell-like parts.
         let parts = shlex::split(&editor_str).ok_or_eyre("Failed to parse editor command")?;
         let (command, args) = parts.split_first().ok_or_eyre("No editor command found")?;
 
-        let status = std::process::Command::new(command).args(args).arg(&path).status()?;
+        let status = std::process::Command::new(command)
+            .args(args)
+            .arg(&path)
+            .status()
+            .wrap_err_with(|| format!("failed to open editor `{command}`"))?;
         if !status.success() {
-            bail!("failed to open editor");
+            bail!("editor `{command}` failed ({status})");
         }
 
         // Read back the edited content
@@ -185,12 +188,18 @@ impl Cmd {
                                 // Convert the bytes to a string and forward to script
                                 let input = String::from_utf8_lossy(&buffer[0..n]).to_string();
                                 if let Err(e) = sender.send(input).await {
-                                    eprintln!("Error sending input to script: {e}");
+                                    userio::log::warn!(
+                                        "scripts-stdin-send-failed",
+                                        error = e.to_string()
+                                    );
                                     break;
                                 }
                             },
                             Err(e) => {
-                                eprintln!("Error reading from stdin: {e}");
+                                userio::log::warn!(
+                                    "scripts-stdin-read-failed",
+                                    error = e.to_string()
+                                );
                                 break;
                             }
                         }
@@ -208,7 +217,7 @@ impl Cmd {
 
         let code = exit_code.unwrap_or(-1);
         if code != 0 {
-            eprintln!("Script exited with code {code}");
+            userio::log::warn!("scripts-exit-code", code = code);
         }
 
         Ok(code)
@@ -225,7 +234,7 @@ impl Cmd {
         let script_content = if let Some(count_opt) = new_script.last {
             // Get the last N commands from history, plus 1 to exclude the command that runs this script
             let count = count_opt.unwrap_or(1) + 1; // Add 1 to the count to exclude the current command
-            let context = atuin_client::database::current_context().await?;
+            let context = atuin_client::database::current_context(settings).await?;
 
             // Get the last N+1 commands, filtering by the default mode
             let filters = [settings.default_filter_mode(context.git_root.is_some())];
@@ -279,7 +288,7 @@ impl Cmd {
 
         script_store.create(script).await?;
 
-        script_store.build(script_db).await?;
+        script_store.build(&script_db).await?;
 
         Ok(())
     }
@@ -306,8 +315,8 @@ impl Cmd {
                         .insert(key.to_string(), serde_json::Value::String(value.to_string()));
                     debug!("Using CLI variable: {}={}", key, value);
                 } else {
-                    eprintln!("Warning: Ignoring malformed variable specification: {var_str}");
-                    eprintln!("Variables should be specified as KEY=VALUE");
+                    userio::log::warn!("scripts-var-malformed", spec = var_str);
+                    userio::log::info!("scripts-var-format-hint");
                 }
             }
 
@@ -317,7 +326,7 @@ impl Cmd {
 
             // If there are variables in the template that weren't specified on the command line, prompt for them
             if !remaining_vars.is_empty() {
-                println!("This script contains template variables that need values:");
+                userio::log::info!("scripts-var-prompt");
 
                 let stdin = std::io::stdin();
                 let mut input = String::new();
@@ -325,10 +334,10 @@ impl Cmd {
                 for var in remaining_vars {
                     input.clear();
 
-                    println!("Enter value for '{var}': ");
+                    userio::log::info!("scripts-var-enter", variable = &var);
 
                     if stdin.read_line(&mut input).is_err() {
-                        eprintln!("Failed to read input for variable '{var}'");
+                        userio::log::warn!("scripts-var-read-failed", variable = &var);
                         // Provide an empty string as fallback
                         variable_values.insert(var, serde_json::Value::String(String::new()));
                         continue;
@@ -364,7 +373,7 @@ impl Cmd {
         let scripts = script_db.list().await?;
 
         if scripts.is_empty() {
-            println!("No scripts found");
+            userio::log::info!("scripts-none-found");
         } else {
             println!("Available scripts:");
             for script in scripts {
@@ -501,9 +510,9 @@ impl Cmd {
             script_store.update(script).await?;
 
             // Rebuild the database to apply changes
-            script_store.build(script_db).await?;
+            script_store.build(&script_db).await?;
 
-            println!("Script '{}' updated successfully!", edit.name);
+            userio::log::info!("scripts-updated", name = &edit.name);
 
             Ok(())
         } else {
@@ -529,7 +538,7 @@ impl Cmd {
 
                 let input = input.trim().to_lowercase();
                 if input != "y" && input != "yes" {
-                    println!("Deletion cancelled");
+                    userio::log::info!("scripts-delete-cancelled");
                     return Ok(());
                 }
             }
@@ -538,9 +547,9 @@ impl Cmd {
             script_store.delete(script.id).await?;
 
             // Rebuild the database to apply changes
-            script_store.build(script_db).await?;
+            script_store.build(&script_db).await?;
 
-            println!("Script '{}' deleted successfully", delete.name);
+            userio::log::info!("scripts-deleted", name = &delete.name);
             Ok(())
         } else {
             bail!("script '{}' not found", delete.name);
@@ -554,7 +563,7 @@ impl Cmd {
         store: SqliteStore,
         history_db: &Sqlite,
     ) -> Result<()> {
-        let host_id = Settings::host_id().await?;
+        let host_id = settings.host_id().await?;
         let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
             .context("could not load or generate encryption key")?;
 
@@ -578,5 +587,30 @@ impl Cmd {
                 Self::handle_delete(settings, delete, script_store, script_db).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use atuin_common::env::MockEnv;
+    use rstest::rstest;
+
+    use super::Cmd;
+
+    #[rstest]
+    #[case("missing-editor")]
+    #[case("missing editor")]
+    fn missing_editor_reports_the_command_and_preserves_the_io_error(#[case] name: &str) {
+        let env = MockEnv::install();
+        let dir = tempfile::tempdir().unwrap();
+        let editor = dir.path().join(name);
+        env.set("EDITOR", format!("'{}' --wait", editor.display()));
+
+        let error = Cmd::open_editor(Some("echo hello")).unwrap_err();
+
+        assert_eq!(error.to_string(), format!("failed to open editor `{}`", editor.display()));
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::NotFound);
     }
 }

@@ -3,9 +3,8 @@ use atuin_client::history::store::HistoryStore;
 use atuin_client::record::sqlite_store::SqliteStore;
 use atuin_client::settings::Settings;
 use atuin_common::encryption::paseto_v4;
+use atuin_common::userio;
 use atuin_domain::record::RecordId;
-use atuin_dotfiles::store::AliasStore;
-use atuin_dotfiles::store::var::VarStore;
 use atuin_kv::store::KvStore;
 use atuin_scripts::store::ScriptStore;
 use eyre::{Context, Result};
@@ -25,7 +24,7 @@ pub async fn build(
     let encryption_key = paseto_v4::Key::try_load_from_path(&settings.key_path)
         .context("could not load encryption key")?;
 
-    let host_id = Settings::host_id().await?;
+    let host_id = settings.host_id().await?;
 
     let downloaded = downloaded.unwrap_or(&[]);
 
@@ -36,27 +35,17 @@ pub async fn build(
     .await?;
 
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key.clone());
-    let alias_store = AliasStore::new(store.clone(), host_id, encryption_key.clone());
-    let var_store = VarStore::new(store.clone(), host_id, encryption_key.clone());
     let kv_store = KvStore::new(store.clone(), kv_db, host_id, encryption_key.clone());
     let script_store = ScriptStore::new(store.clone(), host_id, encryption_key);
 
     // A failure in one store should not stop the others from building - build as much as
     // possible, and warn about the rest.
     if let Err(e) = history_store.build_all(db, downloaded).await {
-        eprintln!("Warning: failed to build history: {e}");
-    }
-
-    if let Err(e) = alias_store.build().await {
-        eprintln!("Warning: failed to build aliases: {e}");
-    }
-
-    if let Err(e) = var_store.build().await {
-        eprintln!("Warning: failed to build vars: {e}");
+        userio::log::warn!("sync-build-history-failed", error = e.to_string());
     }
 
     if let Err(e) = kv_store.build().await {
-        eprintln!("Warning: failed to build kv: {e}");
+        userio::log::warn!("sync-build-kv-failed", error = e.to_string());
     }
 
     let script_db = atuin_scripts::database::Database::new(
@@ -65,8 +54,8 @@ pub async fn build(
     )
     .await?;
 
-    if let Err(e) = script_store.build(script_db).await {
-        eprintln!("Warning: failed to build scripts: {e}");
+    if let Err(e) = script_store.build(&script_db).await {
+        userio::log::warn!("sync-build-scripts-failed", error = e.to_string());
     }
 
     Ok(())

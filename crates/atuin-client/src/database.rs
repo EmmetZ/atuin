@@ -1,11 +1,11 @@
 use std::env;
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atuin_common::db::sqlite::{Sqlite as CommonSqlite, SqliteBuilder};
 use atuin_common::filter::{self, OrFilter};
-use atuin_common::time::OffsetDateTimeExt;
+use atuin_common::time::{OffsetDateTimeExt, UtcOffsetSpec};
 use atuin_common::{db, utils};
 use atuin_domain::record::{CmdOrigin, UNKNOWN_USER};
 use easy_cast::{CastFloat, Conv};
@@ -14,14 +14,17 @@ use sql_builder::bind::Bind;
 use sql_builder::{SqlBuilder, SqlName, esc, quote};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Result, Row};
+use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::instrument;
 use uuid::Uuid;
 
 use super::history::History;
 use super::ordering;
-use super::settings::{FilterMode, SearchMode, Settings};
-use crate::history::{AuthorKind, AuthorPattern, HistoryId, HistoryStats, KNOWN_AGENTS};
+use super::settings::{Dialect, FilterMode, SearchMode, Settings};
+use crate::history::{
+    AuthorKind, AuthorPattern, CommandRuns, HistoryId, HistoryStats, KNOWN_AGENTS,
+};
 
 #[derive(Clone)]
 pub struct Context {
@@ -32,11 +35,20 @@ pub struct Context {
     pub git_root: Option<PathBuf>,
 }
 
+impl Context {
+    fn git_root_str(&self) -> &str {
+        // Existing behavior: fall back to `self.cwd` if there's no Git root.
+        self.git_root.as_deref().and_then(Path::to_str).unwrap_or(&self.cwd)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct OptFilters<'a> {
-    pub exit: Option<i64>,
-    pub exclude_exit: Option<i64>,
-    /// Only commands that recorded a non-zero exit. Unlike `exclude_exit: 0`,
+    /// Include any of these exit codes. An empty slice means no restriction.
+    pub exit: &'a [i64],
+    /// Exclude all of these exit codes. An empty slice means no restriction.
+    pub exclude_exit: &'a [i64],
+    /// Only commands that recorded a non-zero exit. Unlike `exclude_exit: &[0]`,
     /// this also skips the `exit = -1` sentinel rows for commands still
     /// running (or whose end hook never fired).
     pub only_failed: bool,
@@ -52,6 +64,12 @@ pub struct OptFilters<'a> {
     pub authors: OrFilter<&'a [AuthorPattern]>,
     /// Shell filter. The empty string matches commands that have no recorded shell.
     pub shells: OrFilter<&'a [String]>,
+    /// Offset that `before`/`after` strings without an explicit offset are interpreted in, and
+    /// that relative phrases like "today" are anchored to. Pass `settings.timezone`; the
+    /// `Default` is UTC.
+    pub timezone: UtcOffsetSpec,
+    /// Date dialect (day/month order) for parsing `before`/`after`. Pass `settings.dialect`.
+    pub dialect: Dialect,
 }
 
 /// Build a query [`Context`] without requiring a live shell session.
@@ -60,32 +78,32 @@ pub struct OptFilters<'a> {
 /// `ATUIN_SESSION` is unset; the session is left empty so session-scoped
 /// filters simply match nothing.
 #[instrument(level = "trace", skip_all, err)]
-pub async fn query_context() -> eyre::Result<Context> {
-    let session = env::var("ATUIN_SESSION").unwrap_or_default();
+pub async fn query_context(settings: &Settings) -> eyre::Result<Context> {
+    let session = atuin_common::env::var("ATUIN_SESSION").unwrap_or_default();
     let cmd_origin = CmdOrigin::probe_current();
     let cwd = utils::get_current_dir();
-    let host_id = Settings::host_id().await?;
-    let git_root = utils::in_git_repo(cwd.as_str());
+    let host_id = settings.host_id().await?;
+    let git_root = utils::in_git_repo(&cwd);
 
     Ok(Context {
         session,
         cmd_origin,
-        cwd,
+        cwd: cwd.to_string_lossy().into(),
         git_root,
         host_id: host_id.0.as_simple().to_string(),
     })
 }
 
 #[instrument(level = "trace", skip_all, err)]
-pub async fn current_context() -> eyre::Result<Context> {
-    if env::var("ATUIN_SESSION").is_err() {
+pub async fn current_context(settings: &Settings) -> eyre::Result<Context> {
+    if atuin_common::env::var("ATUIN_SESSION").is_err() {
         return Err(eyre::eyre!(
             "Failed to find $ATUIN_SESSION in the environment. Check that you have correctly set \
              up your shell."
         ));
     }
 
-    query_context().await
+    query_context(settings).await
 }
 
 impl Context {
@@ -96,7 +114,7 @@ impl Context {
             cwd: entry.cwd.clone(),
             cmd_origin: entry.cmd_origin.clone(),
             host_id: String::new(),
-            git_root: utils::in_git_repo(entry.cwd.as_str()),
+            git_root: utils::in_git_repo(entry.cwd.as_ref()),
         }
     }
 }
@@ -319,6 +337,40 @@ struct HistoryWithCount {
     count: i32,
 }
 
+/// A failure while migrating a local sqlite database on startup.
+#[derive(Debug, Error)]
+pub enum DbSetupError {
+    #[error(
+        "This copy of Atuin cannot open a database likely updated by a newer version.\nYou may \
+         have multiple versions of Atuin installed, and your shell is running an older \
+         copy.\nRunning executable: {}\n\nCheck `atuin --version` and `which -a atuin` \
+         (`where.exe atuin` on Windows).\nUpdate Atuin and remove older copies from your PATH, \
+         then restart your shells and any Atuin daemon.\nDo not delete your database files or \
+         migration records: this may lose your history.",
+        .executable.display()
+    )]
+    IncompatibleVersion {
+        executable: PathBuf,
+        #[source]
+        source: sqlx::migrate::MigrateError,
+    },
+    #[error(transparent)]
+    Migrate(sqlx::migrate::MigrateError),
+}
+
+impl From<sqlx::migrate::MigrateError> for DbSetupError {
+    fn from(error: sqlx::migrate::MigrateError) -> Self {
+        match error {
+            sqlx::migrate::MigrateError::VersionMissing(_) => Self::IncompatibleVersion {
+                executable: env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("<unable to determine executable path>")),
+                source: error,
+            },
+            other => Self::Migrate(other),
+        }
+    }
+}
+
 impl Sqlite {
     #[instrument(level = "trace", skip_all, fields(timeout = ?timeout), err)]
     pub async fn new(path: impl AsRef<OsStr>, timeout: Duration) -> eyre::Result<Self> {
@@ -352,7 +404,7 @@ impl Sqlite {
     }
 
     #[instrument(level = "trace", skip_all, err)]
-    async fn setup_db(pool: &SqlitePool) -> Result<()> {
+    async fn setup_db(pool: &SqlitePool) -> std::result::Result<(), DbSetupError> {
         debug!("running sqlite database setup");
 
         db::migrate!(pool, "./migrations").await?;
@@ -383,16 +435,6 @@ impl Sqlite {
         .bind(h.author_kind.map(|kind| i64::from(kind.as_u8())))
         .execute(&mut **tx)
         .await?;
-
-        Ok(())
-    }
-
-    #[instrument(level = "trace", skip_all, fields(id = ?id), err)]
-    async fn delete_row_raw(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        id: HistoryId,
-    ) -> Result<()> {
-        db::query("delete from history where id = ?1").bind(id).execute(&mut **tx).await?;
 
         Ok(())
     }
@@ -466,6 +508,13 @@ impl Sqlite {
         .await?;
 
         Ok(res)
+    }
+
+    #[instrument(level = "trace", skip_all, err)]
+    pub async fn active_ids(&self) -> Result<Vec<HistoryId>> {
+        db::query_scalar::<_, HistoryId>("select id from history where deleted_at is null")
+            .fetch_all(self.sqlite.pool())
+            .await
     }
 
     #[instrument(level = "trace", skip_all, err)]
@@ -565,12 +614,7 @@ impl Sqlite {
             query.and_where_is_null("deleted_at");
         }
 
-        let git_root = if let Some(git_root) = context.git_root.clone() {
-            git_root.to_str().unwrap_or("/").to_string()
-        } else {
-            context.cwd.clone()
-        };
-
+        let git_root = context.git_root_str();
         let session_start = get_session_start_time(&context.session);
 
         for filter in filters {
@@ -586,7 +630,7 @@ impl Sqlite {
                     &mut query
                 }
                 FilterMode::Directory => query.and_where_eq("cwd", quote(&context.cwd)),
-                FilterMode::Workspace => query.and_where_like_left("cwd", &git_root),
+                FilterMode::Workspace => query.and_where_like_left("cwd", git_root),
             };
         }
 
@@ -684,12 +728,7 @@ impl Sqlite {
         let mut sql = SqlBuilder::select_from("history");
         sql.field(HISTORY_COLUMNS);
 
-        let git_root = if let Some(git_root) = context.git_root.clone() {
-            git_root.to_str().unwrap_or("/").to_string()
-        } else {
-            context.cwd.clone()
-        };
-
+        let git_root = context.git_root_str();
         let session_start = get_session_start_time(&context.session);
 
         match filter {
@@ -764,9 +803,16 @@ impl Sqlite {
             sql.and_where("command regexp ?".bind(&regex));
         }
 
-        filter_options.exit.map(|exit| sql.and_where_eq("exit", exit));
+        if !filter_options.exit.is_empty() {
+            sql.and_where(format!("exit in ({})", filter_options.exit.iter().join(", ")));
+        }
 
-        filter_options.exclude_exit.map(|exclude_exit| sql.and_where_ne("exit", exclude_exit));
+        if !filter_options.exclude_exit.is_empty() {
+            sql.and_where(format!(
+                "exit not in ({})",
+                filter_options.exclude_exit.iter().join(", ")
+            ));
+        }
 
         if filter_options.only_failed {
             sql.and_where("exit != 0 AND exit != -1");
@@ -776,23 +822,20 @@ impl Sqlite {
 
         filter_options.exclude_cwd.map(|exclude_cwd| sql.and_where_ne("cwd", quote(exclude_cwd)));
 
+        let now = OffsetDateTime::now_utc().to_offset(filter_options.timezone.0);
+        let dialect = filter_options.dialect.into();
+
         if let Some(before) = filter_options.before {
-            let parsed =
-                interim::parse_date_string(before, OffsetDateTime::now_utc(), interim::Dialect::Uk)
-                    .map_err(|e| {
-                        sqlx::Error::Decode(
-                            format!("invalid `before` filter {before:?}: {e}").into(),
-                        )
-                    })?;
+            let parsed = interim::parse_date_string(before, now, dialect).map_err(|e| {
+                sqlx::Error::Decode(format!("invalid `before` filter {before:?}: {e}").into())
+            })?;
             sql.and_where_lt("timestamp", quote(i64::conv(parsed.unix_timestamp_nanos())));
         }
 
         if let Some(after) = filter_options.after {
-            let parsed =
-                interim::parse_date_string(after, OffsetDateTime::now_utc(), interim::Dialect::Uk)
-                    .map_err(|e| {
-                        sqlx::Error::Decode(format!("invalid `after` filter {after:?}: {e}").into())
-                    })?;
+            let parsed = interim::parse_date_string(after, now, dialect).map_err(|e| {
+                sqlx::Error::Decode(format!("invalid `after` filter {after:?}: {e}").into())
+            })?;
             sql.and_where_gt("timestamp", quote(i64::conv(parsed.unix_timestamp_nanos())));
         }
 
@@ -841,18 +884,7 @@ impl Sqlite {
             .fetch_all(self.sqlite.pool())
             .await?;
 
-        // Rank against the same characters SQL matched: drop spaces, operators and negated terms.
-        let reorder_query: String = QueryTokenizer::new(orig_query)
-            .filter(|token| !token.is_inverse())
-            .filter_map(|token| match token {
-                QueryToken::Match(term, _)
-                | QueryToken::MatchStart(term, _)
-                | QueryToken::MatchEnd(term, _)
-                | QueryToken::MatchFull(term, _) => Some(term),
-                QueryToken::Or | QueryToken::Regex(_) => None,
-            })
-            .collect();
-        Ok(ordering::reorder_fuzzy(search_mode, &reorder_query, res))
+        Ok(ordering::reorder_fuzzy(search_mode, &ranking_query(orig_query), res))
     }
 
     #[instrument(level = "trace", skip_all, err)]
@@ -951,9 +983,45 @@ impl Sqlite {
         Ok(res.into_iter().map(|r| (r.history, r.count)).collect())
     }
 
+    /// Every command in history run by one of `authors`, with how often and when it ran.
+    #[instrument(level = "trace", skip_all, err)]
+    pub async fn command_runs(
+        &self,
+        authors: OrFilter<&[AuthorPattern]>,
+    ) -> Result<Vec<CommandRuns>> {
+        let mut sql = SqlBuilder::select_from("history");
+        sql.fields(&[
+            "command",
+            "count(*)",
+            "sum(exit != 0 AND exit != -1)",
+            "min(timestamp)",
+            "max(timestamp)",
+            "cwd",
+        ])
+        .and_where_is_null("deleted_at")
+        .group_by("command");
+        apply_author_filter(&mut sql, authors);
+        let sql = sql.sql().expect("bug in command runs query. please report");
+
+        let rows: Vec<(String, u32, u32, i64, i64, String)> =
+            db::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(self.sqlite.pool()).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(command, runs, failures, first, last, cwd)| CommandRuns {
+                command,
+                runs,
+                failures,
+                first: OffsetDateTime::from_unix_nanos_i64(first),
+                last: OffsetDateTime::from_unix_nanos_i64(last),
+                cwd,
+            })
+            .collect())
+    }
+
     #[must_use]
-    pub fn all_paged(&self, page_size: usize, include_deleted: bool, unique: bool) -> Paged {
-        Paged::new(self.clone(), page_size, include_deleted, unique)
+    pub fn all_paged(&self, page_size: usize, include_deleted: bool) -> Paged {
+        Paged::new(self.clone(), page_size, include_deleted)
     }
 
     // This used to scramble the command and set deleted_at, so that sync v1 could
@@ -973,10 +1041,21 @@ impl Sqlite {
             return Ok(());
         }
 
+        // One `in (...)` statement per chunk that fits the bind-parameter limit, not one
+        // statement per id: per-row deletes made removing 200k entries take ~13s.
+        let ids_per_delete = self.sqlite.info().await.variable_number_limit().max(1);
+
         let mut tx = self.sqlite.pool().begin().await?;
 
-        for id in ids {
-            Self::delete_row_raw(&mut tx, id).await?;
+        while ids.peek().is_some() {
+            let mut builder = sqlx::QueryBuilder::new("delete from history where id in (");
+            let mut list = builder.separated(", ");
+            for id in ids.by_ref().take(ids_per_delete) {
+                list.push_bind(id);
+            }
+            builder.push(")");
+
+            builder.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
@@ -1097,18 +1176,16 @@ pub struct Paged {
     page_size: usize,
     last_id: Option<String>,
     include_deleted: bool,
-    unique: bool,
 }
 
 impl Paged {
     #[must_use]
-    pub fn new(database: Sqlite, page_size: usize, include_deleted: bool, unique: bool) -> Self {
+    pub fn new(database: Sqlite, page_size: usize, include_deleted: bool) -> Self {
         Self {
             database,
             page_size,
             last_id: None,
             include_deleted,
-            unique,
         }
     }
 
@@ -1120,13 +1197,6 @@ impl Paged {
 
         if !self.include_deleted {
             query.and_where_is_null("deleted_at");
-        }
-
-        if self.unique {
-            // We want to deduplicate on command, but the user can search via cwd, hostname, and session.
-            // Without those fields, filter modes won't work right. With those fields, we get duplicates.
-            // This must be handled upstream.
-            query.group_by("command, cwd, hostname, session").having("max(timestamp)");
         }
 
         query.limit(self.page_size);
@@ -1185,6 +1255,29 @@ impl SqlBuilderExt for SqlBuilder {
             self.and_where(cond)
         }
     }
+}
+
+/// The characters fuzzy results are ranked against: the same ones the SQL matched, without
+/// spaces, operators or negated terms.
+#[must_use]
+pub fn ranking_query(query: &str) -> String {
+    QueryTokenizer::new(query)
+        .filter(|token| !token.is_inverse())
+        .filter_map(|token| match token {
+            QueryToken::Match(term, _)
+            | QueryToken::MatchStart(term, _)
+            | QueryToken::MatchEnd(term, _)
+            | QueryToken::MatchFull(term, _) => Some(term),
+            QueryToken::Or | QueryToken::Regex(_) => None,
+        })
+        .collect()
+}
+
+/// Whether fuzzy and full-text search differ for `query`: only plain terms match differently
+/// (spread out or as a substring); operators such as `^prefix` and `'exact` match the same.
+#[must_use]
+pub fn has_fuzzy_terms(query: &str) -> bool {
+    QueryTokenizer::new(query).any(|token| matches!(token, QueryToken::Match(..)))
 }
 
 pub struct QueryTokenizer<'a> {
@@ -1287,8 +1380,10 @@ mod test {
 
     use rstest::{fixture, rstest};
     use time::format_description::well_known::Rfc3339;
+    use time::macros::datetime;
 
     use super::*;
+    use crate::history::all_user_author_filter;
     use crate::settings::test_local_timeout;
 
     /// `ATUIN_SESSION` comes from the environment: a stray value whose version nibble reads as a
@@ -1583,6 +1678,56 @@ mod test {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
+    async fn command_runs_aggregate_live_rows_per_command_by_author(
+        #[future(awt)]
+        #[from(empty_db)]
+        db: Sqlite,
+    ) {
+        let run = |command: &str, timestamp: OffsetDateTime, exit: i64| -> History {
+            let mut history: History =
+                History::capture().timestamp(timestamp).command(command).cwd("/srv").build().into();
+            history.exit = exit;
+            history
+        };
+        let mut deleted = run("svn up", datetime!(2019-01-01 0:00 UTC), 0);
+        deleted.deleted_at = Some(datetime!(2019-01-02 0:00 UTC));
+        let mut by_agent = run("svn up", datetime!(2025-01-01 0:00 UTC), 0);
+        by_agent.author_kind = Some(AuthorKind::Agent);
+        db.save_bulk([
+            &deleted,
+            &by_agent,
+            &run("svn up", datetime!(2020-03-01 0:00 UTC), 0),
+            &run("svn up", datetime!(2023-06-01 0:00 UTC), 1),
+            &run("ls", datetime!(2026-10-29 0:00 UTC), -1),
+        ])
+        .await
+        .unwrap();
+
+        let mut runs = db.command_runs(all_user_author_filter()).await.unwrap();
+        runs.sort_by(|a, b| a.command.cmp(&b.command));
+
+        assert_eq!(runs, [
+            CommandRuns {
+                command: "ls".to_owned(),
+                runs: 1,
+                failures: 0,
+                first: datetime!(2026-10-29 0:00 UTC),
+                last: datetime!(2026-10-29 0:00 UTC),
+                cwd: "/srv".to_owned(),
+            },
+            CommandRuns {
+                command: "svn up".to_owned(),
+                runs: 2,
+                failures: 1,
+                first: datetime!(2020-03-01 0:00 UTC),
+                last: datetime!(2023-06-01 0:00 UTC),
+                cwd: "/srv".to_owned(),
+            },
+        ]);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_load_active_skips_soft_deleted(
         #[future(awt)]
         #[from(empty_db)]
@@ -1651,6 +1796,140 @@ mod test {
         db
     }
 
+    #[fixture]
+    async fn exit_db() -> Sqlite {
+        let db = empty_db().await;
+        for exit in [-1, 0, 1, 2, 130] {
+            let mut entry = save_history_item(&db, &format!("cargo exit {exit}")).await;
+            entry.exit = exit;
+            db.update(&entry).await.unwrap();
+        }
+        db
+    }
+
+    #[rstest]
+    #[case::default(&[], &[], false, &[-1, 0, 1, 2, 130])]
+    #[case::single(&[1], &[], false, &[1])]
+    #[case::single_exclusion(&[], &[0], false, &[-1, 1, 2, 130])]
+    #[case::include_union(&[1, 2], &[], false, &[1, 2])]
+    #[case::exclude_multiple(&[], &[0, 130], false, &[-1, 1, 2])]
+    #[case::overlap(&[0, 1, 2], &[0, 2], false, &[1])]
+    #[case::all_excluded(&[1, 2], &[1, 2], false, &[])]
+    #[case::duplicates(&[1, 1, 2], &[2, 2], false, &[1])]
+    #[case::sentinel(&[-1, 0], &[], false, &[-1, 0])]
+    #[case::only_failed(&[-1, 0, 1, 2], &[2], true, &[1])]
+    #[case::unknown(&[999], &[], false, &[])]
+    #[tokio::test]
+    async fn test_search_exit_filters(
+        #[future(awt)] exit_db: Sqlite,
+        #[case] exit: &[i64],
+        #[case] exclude_exit: &[i64],
+        #[case] only_failed: bool,
+        #[case] expected: &[i64],
+        #[values(DbSearchMode::FullText, DbSearchMode::Prefix, DbSearchMode::Fuzzy)]
+        mode: DbSearchMode,
+    ) {
+        let filters = OptFilters {
+            exit,
+            exclude_exit,
+            only_failed,
+            ..Default::default()
+        };
+        let results = exit_db
+            .search(mode, FilterMode::Global, &new_context(), "cargo", filters)
+            .await
+            .unwrap();
+        let mut actual: Vec<_> = results.iter().map(|h| h.exit).collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+
+        let results = exit_db
+            .search(mode, FilterMode::Global, &new_context(), "unmatched", filters)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+        let results = exit_db
+            .search(mode, FilterMode::Global, &new_context(), "", OptFilters {
+                cwd: Some("/other"),
+                ..filters
+            })
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_search_exit_filters_before_deduplication(
+        #[future(awt)] empty_db: Sqlite,
+        #[values(false, true)] include_duplicates: bool,
+    ) {
+        let mut matching_ids = Vec::new();
+        for (timestamp, exit) in [(1, 1), (2, 2), (3, 0)] {
+            let mut entry = save_history_item(&empty_db, "cargo test").await;
+            entry.timestamp = OffsetDateTime::from_unix_timestamp(timestamp).unwrap();
+            entry.exit = exit;
+            empty_db.update(&entry).await.unwrap();
+            if exit != 0 {
+                matching_ids.push(entry.id);
+            }
+        }
+        matching_ids.reverse();
+        if !include_duplicates {
+            matching_ids.truncate(1);
+        }
+        let results = empty_db
+            .search(DbSearchMode::FullText, FilterMode::Global, &new_context(), "", OptFilters {
+                exit: &[0, 1, 2],
+                exclude_exit: &[0, 130],
+                include_duplicates,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.iter().map(|h| h.id).collect::<Vec<_>>(), matching_ids);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_search_exit_filters_deletion_selection(#[future(awt)] exit_db: Sqlite) {
+        let filters = OptFilters {
+            exit: &[0, 1, 2],
+            exclude_exit: &[0, 130],
+            limit: Some(1),
+            ..Default::default()
+        };
+        let mut deleted = Vec::new();
+        for _ in 0..3 {
+            let results = exit_db
+                .search(DbSearchMode::FullText, FilterMode::Global, &new_context(), "", filters)
+                .await
+                .unwrap();
+            if results.is_empty() {
+                break;
+            }
+            for entry in results {
+                deleted.push(entry.exit);
+                exit_db.delete(entry).await.unwrap();
+            }
+        }
+        deleted.sort_unstable();
+        assert_eq!(deleted, [1, 2]);
+        let remaining = exit_db
+            .search(
+                DbSearchMode::FullText,
+                FilterMode::Global,
+                &new_context(),
+                "",
+                OptFilters::default(),
+            )
+            .await
+            .unwrap();
+        let mut exits: Vec<_> = remaining.iter().map(|h| h.exit).collect();
+        exits.sort_unstable();
+        assert_eq!(exits, [-1, 0, 130]);
+    }
+
     #[rstest]
     #[case::window_spans_the_item(Some((-1, 1)), 1, true)]
     #[case::after_bound_is_exclusive(Some((0, 1)), 0, false)]
@@ -1692,6 +1971,34 @@ mod test {
         if expect_ellie_match {
             assert_eq!(results[0].command, "ls /home/ellie");
         }
+    }
+    // The item sits at 15:30:05Z. An explicit offset in the filter must win over the configured
+    // one (+01:00 window = 15:00-16:00Z; misapplying -04:00 would give 20:00-21:00Z), and a bare
+    // string must adopt the configured -04:00 (11:00-12:00 -04:00 = 15:00-16:00Z; UTC would miss).
+    #[rstest]
+    #[case::explicit_offset_wins("2026-01-12T16:00:00+01:00", "2026-01-12T17:00:00+01:00")]
+    #[case::bare_string_uses_configured_offset("2026-01-12T11:00:00", "2026-01-12T12:00:00")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_timezone_before_after(#[case] after: &str, #[case] before: &str) {
+        let item_time = OffsetDateTime::parse("2026-01-12T11:30:05-04:00", &Rfc3339).unwrap();
+
+        let db = Sqlite::in_memory(test_local_timeout()).await.unwrap();
+        new_history_item_at(&db, "ls /home/ellie", Some(item_time)).await.unwrap();
+
+        let context = new_context();
+
+        let results = db
+            .search(DbSearchMode::FullText, FilterMode::Global, &context, "", OptFilters {
+                after: Some(after),
+                before: Some(before),
+                timezone: "-04:00".parse().unwrap(),
+                include_duplicates: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
     }
 
     #[rstest]
@@ -1950,6 +2257,7 @@ mod test {
 
     // SQL operators are stripped when performing fuzzy reordering, but this must not affect the
     // initial SQL matching.
+    #[rstest]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search_fuzzy_operator() {
         let db = db_with(&["use screen", "screenshot tool"]).await;
@@ -1973,7 +2281,7 @@ mod test {
         }
 
         // Create a paged iterator with page_size of 2
-        let mut paged = db.all_paged(2, false, false);
+        let mut paged = db.all_paged(2, false);
 
         // First page should have 2 items
         let page1 = paged.next().await.unwrap();
@@ -2003,35 +2311,11 @@ mod test {
         db: Sqlite,
     ) {
         // Create a paged iterator on empty database
-        let mut paged = db.all_paged(10, false, false);
+        let mut paged = db.all_paged(10, false);
 
         // Should return None immediately
         let page = paged.next().await.unwrap();
         assert!(page.is_none());
-    }
-
-    #[rstest]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_paged_unique(
-        #[future(awt)]
-        #[from(empty_db)]
-        db: Sqlite,
-    ) {
-        // Add duplicate commands
-        new_history_item(&db, "duplicate").await.unwrap();
-        new_history_item(&db, "duplicate").await.unwrap();
-        new_history_item(&db, "unique1").await.unwrap();
-        new_history_item(&db, "unique2").await.unwrap();
-
-        // Without unique flag - should get all 4
-        let mut paged = db.all_paged(10, false, false);
-        let page = paged.next().await.unwrap().unwrap();
-        assert_eq!(page.len(), 4);
-
-        // With unique flag - should get 3 (duplicates collapsed)
-        let mut paged_unique = db.all_paged(10, false, true);
-        let page_unique = paged_unique.next().await.unwrap().unwrap();
-        assert_eq!(page_unique.len(), 3);
     }
 
     #[rstest]
@@ -2070,11 +2354,11 @@ mod test {
         db.delete(to_delete).await.unwrap();
 
         // Deletes remove the row outright, so both views should get 2
-        let mut paged = db.all_paged(10, false, false);
+        let mut paged = db.all_paged(10, false);
         let page = paged.next().await.unwrap().unwrap();
         assert_eq!(page.len(), 2);
 
-        let mut paged_deleted = db.all_paged(10, true, false);
+        let mut paged_deleted = db.all_paged(10, true);
         let page_deleted = paged_deleted.next().await.unwrap().unwrap();
         assert_eq!(page_deleted.len(), 2);
 
@@ -2083,11 +2367,11 @@ mod test {
         legacy.deleted_at = Some(OffsetDateTime::now_utc());
         db.update(&legacy).await.unwrap();
 
-        let mut paged = db.all_paged(10, false, false);
+        let mut paged = db.all_paged(10, false);
         let page = paged.next().await.unwrap().unwrap();
         assert_eq!(page.len(), 1);
 
-        let mut paged_deleted = db.all_paged(10, true, false);
+        let mut paged_deleted = db.all_paged(10, true);
         let page_deleted = paged_deleted.next().await.unwrap().unwrap();
         assert_eq!(page_deleted.len(), 2);
     }
@@ -2412,5 +2696,30 @@ mod test {
             .unwrap();
 
         assert_eq!(results.len(), expected_count, "{results:?}");
+    }
+
+    #[rstest]
+    fn missing_migration_becomes_incompatible_version_guidance() {
+        use std::error::Error;
+
+        let original = sqlx::migrate::MigrateError::VersionMissing(20_260_224_000_100);
+        let raw = original.to_string();
+        let error = DbSetupError::from(original);
+
+        assert!(matches!(error, DbSetupError::IncompatibleVersion { .. }));
+        // Users get recovery guidance, not sqlx's terse "migration not found",
+        assert!(error.to_string().contains("multiple versions of Atuin"));
+        // while the original error stays reachable as the source.
+        assert_eq!(error.source().unwrap().to_string(), raw);
+    }
+
+    #[rstest]
+    fn other_migration_errors_pass_through_unchanged() {
+        let original = sqlx::migrate::MigrateError::VersionMismatch(123);
+        let raw = original.to_string();
+        let error = DbSetupError::from(original);
+
+        assert!(matches!(error, DbSetupError::Migrate(_)));
+        assert_eq!(error.to_string(), raw);
     }
 }

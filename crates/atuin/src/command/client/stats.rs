@@ -1,12 +1,17 @@
+use std::io::{self, Write as _};
+
 use atuin_client::database::{Sqlite, current_context};
 use atuin_client::settings::{FilterMode, Settings};
 use atuin_client::theme::Theme;
-use atuin_history::stats::{compute, pretty_print};
+use atuin_history::stats::{compute, is_ignored, pretty_print};
 use clap::Parser;
 use eyre::Result;
 use interim::parse_date_string;
 use time::{Duration, OffsetDateTime, Time};
 use tracing::instrument;
+
+use super::halloween::HalloweenExt as _;
+use crate::i18n::fl;
 
 fn parse_ngram_size(s: &str) -> Result<usize, String> {
     let value = s.parse::<usize>().map_err(|_| format!("'{s}' is not a valid window size"))?;
@@ -18,38 +23,35 @@ fn parse_ngram_size(s: &str) -> Result<usize, String> {
     Ok(value)
 }
 
-fn period_long_help() -> String {
-    format!(
-        "Compute statistics for the specified period, leave blank for statistics since the \
-         beginning. See [this]({}) for more details.",
-        atuin_common::docs::url("reference/stats/")
-    )
-}
-
 #[derive(Parser, Debug)]
 #[command(infer_subcommands = true)]
 pub struct Cmd {
-    /// Compute statistics for the specified period, leave blank for statistics since the beginning
-    #[arg(long_help = period_long_help())]
+    #[arg(
+        help = fl!("arg-stats-period"),
+        long_help = fl!("arg-stats-period", "long", url = atuin_common::docs::url("reference/stats/"))
+    )]
     period: Vec<String>,
 
-    /// How many top commands to list
-    #[arg(long, short, default_value = "10")]
+    #[arg(long, short, default_value = "10", help = fl!("arg-stats-count"))]
     count: usize,
 
-    /// The number of consecutive commands to consider
-    #[arg(long, short, default_value = "1", value_parser = parse_ngram_size)]
+    #[arg(
+        long,
+        short,
+        default_value = "1",
+        value_parser = parse_ngram_size,
+        help = fl!("arg-stats-ngram-size")
+    )]
     ngram_size: usize,
 
-    /// Filter commands by scope [global, host, session, directory, workspace]
-    #[arg(long = "filter-mode")]
+    #[arg(long = "filter-mode", help = fl!("arg-stats-filter-mode"))]
     filter_mode: Option<FilterMode>,
 }
 
 impl Cmd {
     #[instrument(level = "trace", skip_all, err)]
     pub async fn run(&self, db: &Sqlite, settings: &Settings, theme: &Theme) -> Result<()> {
-        let context = current_context().await?;
+        let context = current_context(settings).await?;
         let words = if self.period.is_empty() {
             String::from("all")
         } else {
@@ -93,6 +95,19 @@ impl Cmd {
 
         if let Some(stats) = stats {
             pretty_print(stats, self.ngram_size, theme);
+        }
+
+        if now.date().is_halloween_season() {
+            let witching = history
+                .iter()
+                .filter(|h| {
+                    h.timestamp.to_offset(settings.timezone.0).hour() == 3
+                        && !is_ignored(settings, &h.command)
+                })
+                .count();
+            if witching > 0 {
+                writeln!(io::stdout(), "{}", fl!("stats-witching-hour", count = witching))?;
+            }
         }
 
         Ok(())

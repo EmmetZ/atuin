@@ -22,6 +22,7 @@ http = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
+secrecy = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -40,6 +41,7 @@ xxhash-rust = { workspace = true }
 [features]
 # Feature-gated axum integration for the server-side capability handlers (`caps::axum`).
 axum = ["dep:axum"]
+octavo = []
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

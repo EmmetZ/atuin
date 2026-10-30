@@ -176,6 +176,21 @@ Then update `CHANGELOG.md`:
 
 ---
 
+## Step 5.5 — Update Contributors
+
+Regenerate `CONTRIBUTORS`, which `atuin contributors` prints:
+
+```bash
+git log --format='%aN <%aE>' \
+    | grep -vE '\[bot\]|^atuin-bot ' \
+    | LC_ALL=C sort -uf > CONTRIBUTORS
+```
+
+`LC_ALL=C` keeps the order the same on macOS and Linux. Tell the user how
+many names were added (`git diff --numstat -- CONTRIBUTORS`).
+
+---
+
 ## Step 6 — Commit & Push
 
 Stage all changes and commit:
@@ -207,9 +222,10 @@ gh pr create \
     --draft
 ```
 
-Show the PR URL to the user. Tell the user to go review and merge the PR.
+Show the PR URL to the user. Tell the user to go review the PR, mark it ready,
+and comment `/merge` on it.
 
-When the user reports the PR is merged, proceed to the next step.
+When the PR shows as merged, proceed to the next step.
 
 ---
 
@@ -233,9 +249,10 @@ For each approved PR:
 2. **Checkpoint:** Show the PR number and title and ask the user to confirm this
    specific merge. Step 2.5 approved the *timing*; this confirms merging *now*.
 
-3. Merge:
+3. Merge, then wait until the PR shows as merged:
    ```bash
-   gh pr merge <N> --repo atuinsh/atuin --squash
+   gh pr comment <N> --repo atuinsh/atuin --body /merge
+   gh pr view <N> --repo atuinsh/atuin --json state --jq .state  # until MERGED
    ```
 
 These commits land in the tag but are absent from the changelog generated in
@@ -308,7 +325,7 @@ live while the release it points at is still building.
 
 5. Merge each PR the user confirms:
    ```bash
-   gh pr merge <N> --repo atuinsh/atuin --squash
+   gh pr comment <N> --repo atuinsh/atuin --body /merge
    ```
 
 Merging a `docs/` change here fires `trigger-docs-deploy.yml` and the docs go

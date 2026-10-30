@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::LazyLock;
 
 use atuin_common::filter::OrFilter;
@@ -21,12 +20,13 @@ pub(crate) mod builder;
 pub mod capture;
 pub mod store;
 
+pub use builder::HistoryImported;
 pub use capture::CommandCapture;
 
 /// Known AI agent author values. Used by [`History::is_agent`] to guess who ran a command when the
 /// entry does not state it, and so when matching against [`AuthorPattern::AllAgent`] and
 /// [`AuthorPattern::AllUser`].
-pub const KNOWN_AGENTS: &[&str] = &["claude-code", "codex", "copilot", "opencode", "pi"];
+pub const KNOWN_AGENTS: &[&str] = &["claude-code", "codex", "copilot", "omp", "opencode", "pi"];
 
 /// The spelling of [`AuthorPattern::AllUser`] on the command line and in the MCP tool schema.
 pub const AUTHOR_FILTER_ALL_USER: &str = "$all-user";
@@ -68,7 +68,7 @@ impl AuthorKind {
     /// The kind stated by the invoking integration's environment (`ATUIN_HISTORY_AUTHOR_KIND`).
     #[must_use]
     pub fn probe_current() -> Option<Self> {
-        let value = env::var(HISTORY_AUTHOR_KIND_ENV).ok()?;
+        let value = atuin_common::env::var(HISTORY_AUTHOR_KIND_ENV).ok()?;
         clap::ValueEnum::from_str(&value, true).ok()
     }
 }
@@ -124,7 +124,7 @@ const HISTORY_INTENT_ENV: &str = "ATUIN_HISTORY_INTENT";
 /// The author identity exported by the invoking integration (`ATUIN_HISTORY_AUTHOR`).
 #[must_use]
 pub fn probe_author() -> Option<String> {
-    normalize_optional_string(env::var(HISTORY_AUTHOR_ENV).ok())
+    normalize_optional_string(atuin_common::env::var(HISTORY_AUTHOR_ENV).ok())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, derive_more::Display)]
@@ -201,7 +201,18 @@ const V2_AUTHOR_KIND_FIELD_NUMBER: u32 = 13;
 // `Display` is the single source of that form — `.to_string()` derives from it.
 //
 // Be very, very careful changing this.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, derive_more::Display, derive_more::From)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    derive_more::Display,
+    derive_more::From,
+)]
 #[display("{}", _0.as_simple())]
 pub struct HistoryId(uuid::Uuid);
 
@@ -342,6 +353,19 @@ pub struct HistoryStats {
     pub duration_over_time: Vec<(String, i64)>,
 }
 
+/// How often a command ran, and when it first and last did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRuns {
+    pub command: String,
+    pub runs: u32,
+    /// How many of the runs exited non-zero, not counting the `-1` of a run whose exit is unknown.
+    pub failures: u32,
+    pub first: OffsetDateTime,
+    pub last: OffsetDateTime,
+    /// A directory the command ran in.
+    pub cwd: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryDeserializeError<'a> {
     #[error("invalid version: {0}")]
@@ -387,14 +411,14 @@ impl History {
         author_kind: Option<AuthorKind>,
     ) -> Self {
         let session = session
-            .or_else(|| env::var("ATUIN_SESSION").ok())
+            .or_else(|| atuin_common::env::var("ATUIN_SESSION").ok())
             .unwrap_or_else(|| uuid_v7().as_simple().to_string());
         let cmd_origin = cmd_origin.unwrap_or_else(CmdOrigin::probe_current);
         let author = normalize_optional_string(author)
-            .or_else(|| normalize_optional_string(env::var(HISTORY_AUTHOR_ENV).ok()))
+            .or_else(|| normalize_optional_string(atuin_common::env::var(HISTORY_AUTHOR_ENV).ok()))
             .unwrap_or_else(|| cmd_origin.user().to_string());
         let intent = normalize_optional_string(intent)
-            .or_else(|| normalize_optional_string(env::var(HISTORY_INTENT_ENV).ok()));
+            .or_else(|| normalize_optional_string(atuin_common::env::var(HISTORY_INTENT_ENV).ok()));
         let shell = normalize_optional_string(shell);
 
         Self {

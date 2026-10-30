@@ -9,14 +9,12 @@ pub mod api_client;
 pub mod auth;
 #[cfg(feature = "hub")]
 pub mod hub;
-#[cfg(feature = "sync")]
-pub mod login;
-#[cfg(feature = "sync")]
-pub mod register;
 
+pub mod ai_session;
 pub mod database;
 pub mod distro;
 pub mod history;
+mod i18n;
 pub mod import;
 pub mod logout;
 pub mod logs;
@@ -27,3 +25,4 @@ pub mod plugin;
 pub mod record;
 pub mod settings;
 pub mod theme;
+pub mod tui;

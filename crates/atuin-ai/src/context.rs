@@ -5,6 +5,7 @@ use atuin_client::distro::detect_linux_distribution;
 use atuin_client::history::History;
 use atuin_client::settings::AiCapabilities;
 use atuin_common::time::UtcOffsetExt;
+use secrecy::SecretString;
 
 use crate::tools::descriptor;
 
@@ -13,9 +14,9 @@ use crate::tools::descriptor;
 #[derive(Clone, Debug)]
 pub struct AppContext {
     pub endpoint: reqwest::Url,
-    /// Bearer token for `endpoint`. Empty means unauthenticated — no
+    /// Bearer token for `endpoint`. `None` means unauthenticated -- no
     /// Authorization header is sent (an OSS server may not require auth).
-    pub token: String,
+    pub token: Option<SecretString>,
     /// Whether `endpoint` is an Atuin Hub instance. Hub endpoints report
     /// credit usage; OSS endpoints (e.g. atuin-ai-server) don't have the
     /// usage API, so usage fetching and caching are skipped.
@@ -73,7 +74,7 @@ pub fn capability_strings(capabilities: &AiCapabilities, daemon_enabled: bool) -
     {
         caps.push(cap(descriptor::ATUIN_OUTPUT));
     }
-    if let Ok(extra) = std::env::var("ATUIN_AI__ADDITIONAL_CAPS") {
+    if let Ok(extra) = atuin_common::env::var("ATUIN_AI__ADDITIONAL_CAPS") {
         caps.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
     }
     caps

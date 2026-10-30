@@ -1,8 +1,13 @@
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use atuin_client::database::Sqlite;
+use atuin_client::settings::Settings;
+use atuin_common::dirs;
+use atuin_common::path::PathBufExt as _;
 use easy_cast::Conv;
 use eyre::{Context as _, Result, bail};
+use secrecy::{ExposeSecret as _, SecretString};
 use tracing::{debug, info};
 
 use crate::context::{AppContext, ClientContext};
@@ -14,8 +19,8 @@ use crate::tui::state::ConversationEvent;
 pub async fn run(
     initial_command: Option<String>,
     api_endpoint: Option<String>,
-    api_token: Option<String>,
-    settings: &atuin_client::settings::Settings,
+    api_token: Option<SecretString>,
+    settings: &Arc<Settings>,
     output_for_hook: bool,
 ) -> Result<()> {
     if settings.ai.enabled == Some(false) {
@@ -48,21 +53,21 @@ pub async fn run(
             .unwrap_or_else(|| atuin_client::settings::DEFAULT_HUB_URL.clone()),
     };
     let endpoint_is_hub = settings.is_hub_ai_endpoint(&endpoint);
-    let api_token = api_token.as_deref().or(settings.ai.api_token.as_deref());
+    let api_token = api_token.or_else(|| settings.ai.api_token.clone());
 
     let (token, token_from_hub_session) = match api_token {
-        Some(token) => (token.to_string(), false),
-        None if endpoint_is_hub => (ensure_hub_session(settings).await?, true),
+        // An empty token means unauthenticated, not a login prompt.
+        Some(token) => (Some(token).filter(|t| !t.expose_secret().is_empty()), false),
+        None if endpoint_is_hub => (Some(ensure_hub_session(settings).await?), true),
         // An OSS server may not require auth; hit it without a token rather
         // than forcing a login flow that doesn't apply.
-        None => (String::new(), false),
+        None => (None, false),
     };
 
     let history_db_path = &settings.db_path;
-    let history_db =
-        Sqlite::new(history_db_path, Duration::try_from_secs_f64(settings.local_timeout)?)
-            .await
-            .context("failed to open history database for AI")?;
+    let history_db = Sqlite::new(history_db_path, settings.local_timeout)
+        .await
+        .context("failed to open history database for AI")?;
 
     // Support both legacy [ai] send_cwd and new [ai.opening] send_cwd
     let send_cwd =
@@ -74,9 +79,8 @@ pub async fn run(
         None
     };
 
-    let git_root = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| atuin_common::utils::in_git_repo(cwd.to_str()?));
+    let git_root =
+        std::env::current_dir().ok().and_then(|cwd| atuin_common::utils::in_git_repo(&cwd));
 
     let ctx = AppContext {
         endpoint,
@@ -85,7 +89,7 @@ pub async fn run(
         token_from_hub_session,
         send_cwd,
         last_command,
-        history_db: std::sync::Arc::new(history_db),
+        history_db: Arc::new(history_db),
         git_root,
         capabilities: settings.ai.capabilities.clone(),
         daemon_enabled: settings.daemon.enabled,
@@ -98,8 +102,8 @@ pub async fn run(
     Ok(())
 }
 
-async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Result<String> {
-    if let Some(token) = atuin_client::hub::get_session_token().await? {
+async fn ensure_hub_session(settings: &Settings) -> Result<SecretString> {
+    if let Some(token) = atuin_client::hub::get_session_token(settings).await? {
         debug!("Found Hub session, using existing token");
         return Ok(token);
     }
@@ -129,24 +133,30 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
     println!("Authenticating with Atuin Hub...");
 
     let session = atuin_client::hub::HubAuthSession::start(&hub_address).await?;
-    println!("Open this URL to continue:");
+
+    if session.open_in_browser() {
+        println!("Opened your browser to continue. If it didn't open, visit:");
+    } else {
+        println!("Open this URL to continue:");
+    }
     println!("{}", session.auth_url);
 
     let token = session
         .wait_for_completion(
             atuin_client::hub::DEFAULT_AUTH_TIMEOUT,
             atuin_client::hub::DEFAULT_POLL_INTERVAL,
+            "Waiting for you to authorize in your browser… (Ctrl-C to cancel)",
         )
         .await?;
 
     info!("Authentication complete, saving session token");
-    atuin_client::hub::save_session(&token).await?;
+    atuin_client::hub::save_session(&token, settings).await?;
 
-    if let Ok(meta) = atuin_client::settings::Settings::meta_store().await
+    if let Ok(meta) = settings.meta_store().await
         && let Ok(Some(cli_token)) = meta.session_token().await
     {
         debug!("CLI session found, attempting to link accounts");
-        if let Err(e) = atuin_client::hub::link_account(&hub_address, &cli_token).await {
+        if let Err(e) = atuin_client::hub::link_account(&hub_address, &cli_token, settings).await {
             debug!("Could not link CLI account to Hub: {}", e);
         } else {
             info!("Successfully linked CLI account to Hub");
@@ -158,27 +168,50 @@ async fn ensure_hub_session(settings: &atuin_client::settings::Settings) -> Resu
 
 // ───────────────────────────────────────────────────────────────────
 
+/// The directory where AI snapshots are stored.
+///
+/// Older versions of Atuin stored snapshots in the [legacy data dir] even when [`data_dir`] was set
+/// in config.toml. If the new snapshot dir doesn't exist, this function will check the legacy path
+/// and return it if it exists, unless `ATUIN_HOME` is set.
+///
+/// [legacy data dir]: dirs::legacy_data_dir
+/// [`data_dir`]: field@Settings::data_dir
+fn snapshots_dir(settings: &Settings) -> PathBuf {
+    fn join_snapshots(path: impl Into<PathBuf>) -> PathBuf {
+        path.into().joined("ai").joined("snapshots")
+    }
+
+    let path = join_snapshots(&settings.data_dir);
+    if !path.exists() && !dirs::atuin_home_is_set() {
+        // Check the legacy path, but only if `ATUIN_HOME` isn't set.
+        let legacy = join_snapshots(dirs::legacy_data_dir());
+        if legacy.exists() {
+            return legacy;
+        }
+    }
+    path
+}
+
 async fn run_inline_tui(
     ctx: AppContext,
     initial_prompt: Option<String>,
-    settings: &atuin_client::settings::Settings,
+    settings: &Arc<Settings>,
 ) -> Result<ExitOutcome> {
     let client_ctx = ClientContext::detect();
 
     // Open the session service and check for a resumable session
-    let service = LocalSessionService::open(
-        &settings.ai.db_path,
-        Duration::try_from_secs_f64(settings.local_timeout)?,
-    )
-    .await
-    .context("failed to open AI session database")?;
+    let service = LocalSessionService::open(&settings.ai.db_path, settings.local_timeout)
+        .await
+        .context("failed to open AI session database")?;
 
     // Cached usage renders immediately; a background fetch (spawned below,
     // once the event channel exists) replaces it unless it's fresh. OSS
     // endpoints have no usage API, so both are skipped ("fresh" suppresses
     // the fetch).
-    let (cached_usage, usage_is_fresh) = if ctx.endpoint_is_hub {
-        let usage_key = crate::usage::cache_key(&ctx.token);
+    let (cached_usage, usage_is_fresh) = if ctx.endpoint_is_hub
+        && let Some(token) = &ctx.token
+    {
+        let usage_key = crate::usage::cache_key(token);
         match service.get_cached_usage(&usage_key).await {
             Ok(Some(cached_snapshot)) => {
                 let age =
@@ -199,11 +232,13 @@ async fn run_inline_tui(
     let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
     let git_root_str = ctx.git_root.as_ref().map(|p| p.to_string_lossy().into_owned());
 
-    let session_window_mins = settings.ai.session_continue_minutes.max(0); // treat negative values as 0 to avoid confusion
-    let max_age_secs: i64 = session_window_mins * 60;
-
-    let resumable =
-        service.find_resumable(cwd.as_deref(), git_root_str.as_deref(), max_age_secs).await?;
+    let resumable = service
+        .find_resumable(
+            cwd.as_deref(),
+            git_root_str.as_deref(),
+            settings.ai.session_continue_minutes,
+        )
+        .await?;
 
     // ─── Build FSM ───────────────────────────────────────────────
     let (session_mgr, mut fsm, file_tracker, edit_permissions) = if let Some(stored) = resumable {
@@ -273,8 +308,7 @@ async fn run_inline_tui(
         settings.ai.model.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
 
     // ─── Snapshot store ─────────────────────────────────────────
-    let snapshot_dir =
-        atuin_common::utils::data_dir().join("ai").join("snapshots").join(session_mgr.session_id());
+    let snapshot_dir = snapshots_dir(settings).joined(session_mgr.session_id());
     let snapshot_store = crate::snapshots::SnapshotStore::open(snapshot_dir).ok();
 
     // ─── Discover skills ───────────────────────────────────────
@@ -328,7 +362,7 @@ async fn run_inline_tui(
         cached_usage,
         initial_prompt,
         !usage_is_fresh,
-        settings.clone(),
+        Arc::clone(settings),
     );
     let options =
         eye_declare::RunOptions::default().keyboard(eye_declare::KeyboardProtocol::Enhanced);
@@ -440,7 +474,7 @@ fn render_setup_options(
 }
 
 async fn set_ai_enabled(enabled: bool) -> Result<()> {
-    let config_file = atuin_client::settings::Settings::get_config_path()?;
+    let config_file = Settings::get_config_path()?;
     let config_str = tokio::fs::read_to_string(&config_file).await?;
     let mut doc = config_str.parse::<toml_edit::DocumentMut>()?;
 

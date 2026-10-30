@@ -31,7 +31,14 @@ fn first_whitespace(s: &str) -> usize {
         .map_or(s.len(), |(i, _)| i)
 }
 
-fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str {
+/// Split off the longest configured common prefix, returning the matched prefix
+/// and the remainder with leading whitespace removed. Both slices borrow from
+/// `command`; an empty remainder means the command consists only of the prefix.
+#[must_use]
+pub fn split_common_prefix<'a>(
+    settings: &Settings,
+    command: &'a str,
+) -> Option<(&'a str, &'a str)> {
     // Sort by length so that we match the longest prefix first
     let mut common_prefix = settings.stats.common_prefix.clone();
     common_prefix.sort_by_key(|b| std::cmp::Reverse(b.len()));
@@ -40,14 +47,29 @@ fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str
     for p in &common_prefix {
         if command.starts_with(p) {
             let i = p.len();
-            let prefix = &command[..i];
-            command = command[i..].trim_start();
-            if command.is_empty() {
-                // no commands following, just use the prefix
-                return prefix;
-            }
-            break;
+            return Some((&command[..i], command[i..].trim_start()));
         }
+    }
+    None
+}
+
+/// Whether `stats.ignored_commands` hides `command` from stats.
+#[must_use]
+pub fn is_ignored(settings: &Settings, command: &str) -> bool {
+    let program = interesting_command(settings, strip_leading_env_vars(command.trim()));
+    settings.stats.ignored_commands.iter().any(|c| c == program)
+}
+
+/// The program `command` runs, past any `stats.common_prefix` (`sudo`), with its subcommand when
+/// the program is one of `stats.common_subcommands` (`cargo build`).
+#[must_use]
+pub fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str {
+    if let Some((prefix, remainder)) = split_common_prefix(settings, command) {
+        if remainder.is_empty() {
+            // no commands following, just use the prefix
+            return prefix;
+        }
+        command = remainder;
     }
 
     // Sort the common_subcommands by length so that we match the longest subcommand first
@@ -72,11 +94,21 @@ fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str
     &command[..first_whitespace(command)]
 }
 
-fn split_at_pipe(command: &str) -> Vec<&str> {
+/// The commands of the pipeline `command`, split at each unquoted `|`.
+#[must_use]
+pub fn split_at_pipe(command: &str) -> Vec<&str> {
     let mut result = vec![];
     let mut quoted = false;
     let mut start = 0;
     let mut graphemes = UnicodeSegmentation::grapheme_indices(command, true);
+    // `|&` pipes stderr too; its `&` belongs to the operator, not to the next command.
+    let operator_len = |rest: &str| {
+        if rest.starts_with("|&") {
+            2
+        } else {
+            1
+        }
+    };
 
     while let Some((i, c)) = graphemes.next() {
         let current = i;
@@ -90,7 +122,7 @@ fn split_at_pipe(command: &str) -> Vec<&str> {
             "\\" if graphemes.next().is_some() => {}
             "|" if !quoted => {
                 if current > start && command[start..].starts_with('|') {
-                    start += 1;
+                    start += operator_len(&command[start..]);
                 }
                 result.push(&command[start..current]);
                 start = current;
@@ -99,13 +131,15 @@ fn split_at_pipe(command: &str) -> Vec<&str> {
         }
     }
     if command[start..].starts_with('|') {
-        start += 1;
+        start += operator_len(&command[start..]);
     }
     result.push(&command[start..]);
     result
 }
 
-fn strip_leading_env_vars(command: &str) -> &str {
+/// `command` without its leading `FOO=bar` environment assignments.
+#[must_use]
+pub fn strip_leading_env_vars(command: &str) -> &str {
     // fast path: no equals sign, no environment variable
     if !command.contains('=') {
         return command;
@@ -251,13 +285,11 @@ pub fn compute(
     let mut prefixes = HashMap::<Vec<&str>, usize>::with_capacity(history.len());
 
     for i in history {
-        // just in case it somehow has a leading tab or space or something (legacy atuin didn't ignore space prefixes)
-        let command = strip_leading_env_vars(i.command.trim());
-        let prefix = interesting_command(settings, command);
-
-        if settings.stats.ignored_commands.iter().any(|c| c == prefix) {
+        if is_ignored(settings, &i.command) {
             continue;
         }
+        // just in case it somehow has a leading tab or space or something (legacy atuin didn't ignore space prefixes)
+        let command = strip_leading_env_vars(i.command.trim());
 
         total_unignored += 1;
         commands.insert(command);
@@ -305,9 +337,11 @@ mod tests {
     use rstest::*;
     use time::OffsetDateTime;
 
-    use super::{compute, interesting_command, split_at_pipe, strip_leading_env_vars};
+    use super::{
+        compute, interesting_command, split_at_pipe, split_common_prefix, strip_leading_env_vars,
+    };
 
-    #[test]
+    #[rstest]
     fn ignored_env_vars() {
         let settings = Settings::utc();
 
@@ -322,7 +356,7 @@ mod tests {
         assert_eq!(stats.top.first().unwrap().0, vec!["echo"]);
     }
 
-    #[test]
+    #[rstest]
     fn ignored_commands() {
         let mut settings = Settings::utc();
         settings.stats.ignored_commands.push("cd".to_string());
@@ -341,7 +375,7 @@ mod tests {
         assert_eq!(stats.unique_commands, 1);
     }
 
-    #[test]
+    #[rstest]
     fn all_commands_ignored() {
         let mut settings = Settings::utc();
         settings.stats.ignored_commands.push("cd".to_string());
@@ -376,6 +410,22 @@ mod tests {
     fn interesting_commands(#[case] input: &str, #[case] expected: &str) {
         let settings = Settings::utc();
         assert_eq!(interesting_command(&settings, input), expected);
+    }
+
+    #[rstest]
+    #[case::no_match("echo hello", None)]
+    #[case::prefix("sudo echo hello", Some(("sudo", "echo hello")))]
+    #[case::longest("sudo test echo hello", Some(("sudo test", "echo hello")))]
+    #[case::prefix_only("sudo test", Some(("sudo test", "")))]
+    #[case::trailing_whitespace("sudo test \t ", Some(("sudo test", "")))]
+    #[case::one_removal("sudo doas echo", Some(("sudo", "doas echo")))]
+    #[case::partial_word("sudoedit file", Some(("sudo", "edit file")))]
+    fn splits_common_prefix(
+        #[with(&["sudo test"][..])] settings: Settings,
+        #[case] command: &str,
+        #[case] expected: Option<(&str, &str)>,
+    ) {
+        assert_eq!(split_common_prefix(&settings, command), expected);
     }
 
     // Test with spaces in the common_prefix
@@ -440,6 +490,9 @@ mod tests {
     #[case::emoji("git commit -m \"🚀\"", &["git commit -m \"🚀\""])]
     #[case::starts_with_pipe("| sed 's/[0-9a-f]//g'", &["", " sed 's/[0-9a-f]//g'"])]
     #[case::starts_with_spaces_and_pipe("  | sed 's/[0-9a-f]//g'", &["  ", " sed 's/[0-9a-f]//g'"])]
+    #[case::stderr_pipe("make |& tee build.log", &["make ", " tee build.log"])]
+    #[case::stderr_pipe_then_pipe("make |& tee log | wc -l", &["make ", " tee log ", " wc -l"])]
+    #[case::logical_or_is_not_a_command("a || b", &["a ", "", " b"])]
     fn splits_at_pipe(#[case] input: &str, #[case] expected: &[&str]) {
         assert_eq!(split_at_pipe(input), expected);
     }

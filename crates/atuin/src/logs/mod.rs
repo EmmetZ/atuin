@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 
 use atuin_common::logs::{FileConfig, LogConfig, StderrConfig};
+use atuin_common::userio::log::{SINK, UserFilterExt as _, UserLayer};
 use tracing::Level;
 use tracing_appender::rolling::{self, RollingFileAppender, Rotation};
 use tracing_subscriber::filter::{self, EnvFilter};
@@ -8,15 +9,19 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::TryInitError;
 
+mod held;
 mod otel;
+pub use held::HeldEvents;
 use otel::OtelCtx;
 pub use otel::OtelCtxEnableError;
 
+use crate::i18n::fl;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LogCtxEnableError {
-    #[error("failed to build the otel collector: {0}")]
+    #[error("{}", fl!("log-otel-collector-failed", error = .0.to_string()))]
     OtelCtx(#[from] OtelCtxEnableError),
-    #[error("failed to initialize subscriber: {0}")]
+    #[error("{}", fl!("log-subscriber-init-failed", error = .0.to_string()))]
     Subscriber(#[from] TryInitError),
 }
 
@@ -54,9 +59,10 @@ impl LogCtx {
         config: &LogConfig,
     ) -> Result<Self, LogCtxEnableError> {
         // ATUIN_LOG env var overrides config file level settings
-        let filter: EnvFilter = std::env::var("ATUIN_LOG")
+        let filter: EnvFilter = atuin_common::env::var("ATUIN_LOG")
             .map_or_else(|_| get_base_filter(config), |s| filter::Builder::default().parse_lossy(s))
-            .add_directive("sqlx_sqlite::regexp=off".parse().unwrap());
+            .add_directive("sqlx_sqlite::regexp=off".parse().unwrap())
+            .without_user_messages();
 
         if let Some(file_config) = &config.file {
             clean_up_old_logs(file_config);
@@ -94,9 +100,11 @@ impl LogCtx {
             base.with(
                 config.stderr.as_ref().map(|c| stderr_layer::<_, fmt::time::SystemTime>(c, filter)),
             )
+            .with(UserLayer::new(&SINK))
             .try_init()?;
         } else {
             base.with(config.stderr.as_ref().map(|c| stderr_layer::<_, ()>(c, filter)))
+                .with(UserLayer::new(&SINK))
                 .try_init()?;
         }
 
@@ -106,6 +114,12 @@ impl LogCtx {
         }
 
         Ok(Self { _otel: otel })
+    }
+
+    /// Shows messages for the user and keeps no logs, for a command that must not pay for them.
+    pub fn without_logs() -> Result<Self, LogCtxEnableError> {
+        tracing_subscriber::registry().with(UserLayer::new(&SINK)).try_init()?;
+        Ok(Self { _otel: None })
     }
 }
 
@@ -131,11 +145,7 @@ fn get_base_filter(config: &LogConfig) -> EnvFilter {
 }
 
 fn clean_up_old_logs(config: &FileConfig) {
-    let Some(cutoff) = config
-        .retention_days
-        .checked_mul(24 * 60 * 60)
-        .and_then(|s| std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(s)))
-    else {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(config.retention) else {
         return;
     };
 
@@ -169,7 +179,7 @@ fn clean_up_old_logs(config: &FileConfig) {
 
 #[derive(Debug, thiserror::Error)]
 enum FileWriterError {
-    #[error("log file name must be utf-8")]
+    #[error("{}", fl!("log-file-name-not-utf8"))]
     NonUtf8Filename,
     #[error("{0}")]
     RollingFileAppender(#[from] rolling::InitError),

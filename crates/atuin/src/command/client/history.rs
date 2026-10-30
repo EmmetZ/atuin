@@ -1,5 +1,6 @@
 use std::fmt::{self, Display};
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use atuin_client::database::{Sqlite, current_context};
@@ -14,13 +15,19 @@ use atuin_common::encryption::paseto_v4;
 use atuin_common::logs::LogConfig;
 use atuin_common::string::{EscapeNonPrintablePosixExt as _, NonNulStr};
 use atuin_common::time::{DurationExt, OffsetDateTimeExt, UtcOffsetSpec};
-use atuin_common::utils;
 use atuin_common::utils::normalize_optional_string;
+use atuin_common::{userio, utils};
 #[cfg(feature = "daemon")]
 use atuin_daemon::grpc::history::pb::{
     TailHistoryReply, tail_history_reply::Event as TailEventProto,
 };
 use atuin_domain::record::CmdOrigin;
+#[cfg(feature = "octavo")]
+use atuin_octavo::hub::{HubCallError, HubClient};
+#[cfg(feature = "octavo")]
+use atuin_octavo::pb;
+#[cfg(feature = "octavo")]
+use atuin_octavo::queue::UploadQueue;
 use clap::Subcommand;
 #[cfg(feature = "daemon")]
 use colored::Colorize;
@@ -33,40 +40,37 @@ use tracing::{debug, instrument, warn};
 
 #[cfg(feature = "daemon")]
 use super::daemon;
+use crate::i18n::fl;
 
 #[derive(Subcommand, Debug)]
 #[command(infer_subcommands = true)]
 pub enum Cmd {
-    /// Begins a new command in the history
+    #[command(about = fl!("cmd-history-start"))]
     Start {
-        /// Collects the command from the `ATUIN_COMMAND_LINE` environment variable,
-        /// which does not need escaping and is more compatible between OS and shells
-        #[arg(long = "command-from-env", hide = true)]
+        #[arg(long = "command-from-env", hide = true, help = fl!("arg-history-start-cmd-env"))]
         cmd_env: bool,
 
-        /// Author of this command, eg `ellie`, `claude`, or `copilot`
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-history-start-author"))]
         author: Option<String>,
 
-        /// Whether a human or an AI agent ran this command
-        ///
-        /// [`Option::None`] will cause us to perform a best-guess effort.
-        #[arg(long, value_enum)]
+        #[arg(
+            long,
+            value_enum,
+            help = fl!("arg-history-start-author-kind"),
+            long_help = fl!("arg-history-start-author-kind", "long")
+        )]
         author_kind: Option<AuthorKind>,
 
-        /// Optional intent/rationale for running this command
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-history-start-intent"))]
         intent: Option<String>,
 
         command: Vec<String>,
 
-        /// Passed by shell hooks; this flag disables logging to avoid corrupting the terminal and
-        /// to minimize the amount of time the command takes to run.
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, help = fl!("arg-history-hook"))]
         hook: bool,
     },
 
-    /// Finishes a new command in the history (adds time, exit code)
+    #[command(about = fl!("cmd-history-end"))]
     End {
         id: HistoryId,
         #[arg(long, short)]
@@ -74,16 +78,14 @@ pub enum Cmd {
         #[arg(long, short)]
         duration: Option<u64>,
 
-        /// Passed by shell hooks; this flag disables logging to avoid corrupting the terminal and
-        /// to minimize the amount of time the command takes to run.
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, help = fl!("arg-history-hook"))]
         hook: bool,
     },
 
-    /// Stream history events from the daemon as they are received
+    #[command(about = fl!("cmd-history-tail"))]
     Tail,
 
-    /// List all items in history
+    #[command(about = fl!("cmd-history-list"))]
     List {
         #[arg(long, short)]
         cwd: bool,
@@ -94,12 +96,10 @@ pub enum Cmd {
         #[arg(long)]
         human: bool,
 
-        /// Show only the text of the command
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-cmd-only"))]
         cmd_only: bool,
 
-        /// Terminate the output with a null, for better multiline support
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-print0"))]
         print0: bool,
 
         #[arg(long, short, default_value = "true")]
@@ -109,68 +109,65 @@ pub enum Cmd {
         #[arg(action = clap::ArgAction::Set)]
         reverse: bool,
 
-        /// Display the command time in another timezone other than the configured default.
-        ///
-        /// This option takes one of the following kinds of values:
-        ///
-        /// - the special value "local" (or "l") which refers to the system time zone
-        /// - an offset from UTC (e.g. "+9", "-2:30")
-        #[arg(long, visible_alias = "tz", verbatim_doc_comment)]
+        #[arg(
+            long,
+            visible_alias = "tz",
+            help = fl!("arg-history-timezone"),
+            long_help = fl!("arg-history-timezone", "long")
+        )]
         timezone: Option<UtcOffsetSpec>,
 
-        /// Available variables: {command}, {directory}, {duration}, {user}, {host}, {author}, {intent}, {exit}, {time}, {session}, and {uuid}
-        ///
-        /// Example: --format "{time} - [{duration}] - {directory}$\t{command}"
-        #[arg(long, short)]
+        #[arg(
+            long,
+            short,
+            help = fl!("arg-history-list-format"),
+            long_help = fl!("arg-history-list-format", "long")
+        )]
         format: Option<String>,
     },
 
-    /// Get the last command that was run
+    #[command(about = fl!("cmd-history-last"))]
     Last {
         #[arg(long)]
         human: bool,
 
-        /// Show only the text of the command
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-cmd-only"))]
         cmd_only: bool,
 
-        /// Display the command time in another timezone other than the configured default.
-        ///
-        /// This option takes one of the following kinds of values:
-        ///
-        /// - the special value "local" (or "l") which refers to the system time zone
-        /// - an offset from UTC (e.g. "+9", "-2:30")
-        #[arg(long, visible_alias = "tz", verbatim_doc_comment)]
+        #[arg(
+            long,
+            visible_alias = "tz",
+            help = fl!("arg-history-timezone"),
+            long_help = fl!("arg-history-timezone", "long")
+        )]
         timezone: Option<UtcOffsetSpec>,
 
-        /// Available variables: {command}, {directory}, {duration}, {user}, {host}, {author}, {intent}, {time}, {session}, {uuid} and {relativetime}.
-        ///
-        /// Example: --format "{time} - [{duration}] - {directory}$\t{command}"
-        #[arg(long, short)]
+        #[arg(
+            long,
+            short,
+            help = fl!("arg-history-last-format"),
+            long_help = fl!("arg-history-last-format", "long")
+        )]
         format: Option<String>,
     },
 
     InitStore,
 
-    /// Delete history entries matching the configured exclusion filters
+    #[command(about = fl!("cmd-history-prune"))]
     Prune {
-        /// List matching history lines without performing the actual deletion.
-        #[arg(short = 'n', long)]
+        #[arg(short = 'n', long, help = fl!("arg-history-dry-run"))]
         dry_run: bool,
     },
 
-    /// Delete duplicate history entries (that have the same command, cwd and hostname)
+    #[command(about = fl!("cmd-history-dedup"))]
     Dedup {
-        /// List matching history lines without performing the actual deletion.
-        #[arg(short = 'n', long)]
+        #[arg(short = 'n', long, help = fl!("arg-history-dry-run"))]
         dry_run: bool,
 
-        /// Only delete results added before this date
-        #[arg(long, short)]
+        #[arg(long, short, help = fl!("arg-history-dedup-before"))]
         before: String,
 
-        /// How many recent duplicates to keep
-        #[arg(long)]
+        #[arg(long, help = fl!("arg-history-dedup-dupkeep"))]
         dupkeep: u32,
     },
 }
@@ -241,7 +238,7 @@ pub fn print_list(
 
         // Check for formatting errors before attempting to write
         if let Err(err) = args.status() {
-            eprintln!("ERROR: history output failed with: {err}");
+            userio::log::error!("history-output-failed", error = err.to_string());
             std::process::exit(1);
         }
 
@@ -255,20 +252,14 @@ pub fn print_list(
             }
             Ok(Err(err)) => {
                 if err.kind() != io::ErrorKind::BrokenPipe {
-                    eprintln!("ERROR: Failed to write history output: {err}");
+                    userio::log::error!("history-output-write-failed", error = err.to_string());
                     std::process::exit(1);
                 }
             }
             Err(_) => {
-                eprintln!("ERROR: Format string caused a formatting error.");
-                eprintln!(
-                    "This may be due to an unsupported format string containing special \
-                     characters."
-                );
-                eprintln!(
-                    "Please check your format string syntax and ensure literal braces are \
-                     properly escaped."
-                );
+                userio::log::error!("history-format-error");
+                userio::log::info!("history-format-error-special-chars");
+                userio::log::info!("history-format-error-check-syntax");
                 std::process::exit(1);
             }
         }
@@ -286,7 +277,7 @@ fn check_for_write_errors(write: Result<(), io::Error>) {
     if let Err(err) = write {
         // Ignore broken pipe (issue #626)
         if err.kind() != io::ErrorKind::BrokenPipe {
-            eprintln!("ERROR: History output failed with the following error: {err}");
+            userio::log::error!("history-output-error", error = err.to_string());
             std::process::exit(1);
         }
     }
@@ -354,18 +345,15 @@ fn parse_fmt(format: &str) -> ParsedFmt<'_> {
     match ParsedFmt::new(format) {
         Ok(fmt) => fmt,
         Err(err) => {
-            eprintln!("ERROR: History formatting failed with the following error: {err}");
+            userio::log::error!("history-format-parse-failed", error = err.to_string());
 
             if format.contains('"') && (format.contains(":{") || format.contains(",{")) {
-                eprintln!("It looks like you're trying to create JSON output.");
-                eprintln!("For JSON, you need to escape literal braces by doubling them:");
-                eprintln!("Example: '{{\"command\":\"{{command}}\",\"time\":\"{{time}}\"}}'");
+                userio::log::info!("history-format-json-hint");
+                userio::log::info!("history-format-json-escape");
+                userio::log::info!("history-format-json-example");
             } else {
-                eprintln!(
-                    "If your formatting string contains literal curly braces, you need to escape \
-                     them by doubling:"
-                );
-                eprintln!("Use {{{{ for literal {{ and }}}} for literal }}");
+                userio::log::info!("history-format-braces-hint");
+                userio::log::info!("history-format-braces-example");
             }
             std::process::exit(1)
         }
@@ -423,65 +411,30 @@ fn make_starting_history(
     let h: History = History::capture()
         .timestamp(OffsetDateTime::now_utc())
         .command(command)
-        .cwd(cwd)
+        .cwd(cwd.to_string_lossy().into_owned())
         .author_opt(author)
         .author_kind_opt(author_kind)
         .intent_opt(intent.map(String::from))
-        .shell_opt(std::env::var("ATUIN_SHELL").ok())
+        .shell_opt(atuin_common::env::var("ATUIN_SHELL").ok())
         .build()
         .into();
 
     h.should_save(settings).then_some(h)
 }
 
-#[instrument(level = "trace", skip_all, err)]
-async fn handle_start(
-    db: &Sqlite,
-    settings: &Settings,
-    command: &str,
-    author: Option<&str>,
-    author_kind: Option<AuthorKind>,
-    intent: Option<&str>,
-) -> Result<Option<HistoryId>> {
-    let Some(h) = make_starting_history(settings, command, author, author_kind, intent) else {
-        return Ok(None);
-    };
-
+#[instrument(level = "trace", skip_all)]
+async fn handle_start(db: &Sqlite, h: &History) {
     // Silently ignore database errors to avoid breaking the shell
     // This is important when disk is full or database is locked
-    if let Err(e) = db.save(&h).await {
+    if let Err(e) = db.save(h).await {
         debug!("failed to save history: {e}");
     }
-
-    Ok(Some(h.id))
 }
 
 #[cfg(feature = "daemon")]
 #[instrument(level = "trace", skip_all, err)]
-async fn handle_daemon_start(
-    settings: &Settings,
-    command: &str,
-    author: Option<&str>,
-    author_kind: Option<AuthorKind>,
-    intent: Option<&str>,
-) -> Result<Option<HistoryId>> {
-    let Some(h) = make_starting_history(settings, command, author, author_kind, intent) else {
-        return Ok(None);
-    };
-
-    let local_id = h.id;
-
-    // Attempt to start history via daemon, but silently ignore errors
-    // to avoid breaking the shell when the daemon is unavailable or disk is full
-    let resp = match daemon::start_history(settings, h).await {
-        Ok(id) => id,
-        Err(e) => {
-            debug!("failed to start history via daemon: {e}");
-            local_id
-        }
-    };
-
-    Ok(Some(resp))
+async fn handle_daemon_start(settings: &Settings, h: History) -> Result<HistoryId> {
+    daemon::start_history(settings, h).await
 }
 
 #[allow(unused_variables)]
@@ -490,7 +443,7 @@ async fn handle_end(
     db: &Sqlite,
     store: SqliteStore,
     history_store: HistoryStore,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     id: HistoryId,
     exit: i64,
     duration: Option<u64>,
@@ -529,7 +482,7 @@ async fn handle_end(
     if settings.should_sync().await? {
         #[cfg(feature = "sync")]
         {
-            let engine = record::sync::SyncEngine::builder()
+            let session = record::sync::SyncSession::builder()
                 .store(store.clone())
                 .client_source(record::sync::ClientSource::FromSettings {
                     settings,
@@ -538,8 +491,8 @@ async fn handle_end(
                 .build()
                 .connect()
                 .await?;
-            let (_, downloaded) = engine.keyed(&history_store.encryption_key).sync().await?;
-            Settings::save_sync_time().await?;
+            let (_, downloaded) = session.keyed(&history_store.encryption_key).sync().await?;
+            settings.save_sync_time().await?;
 
             crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
         }
@@ -579,39 +532,57 @@ pub(super) async fn start_history_entry(
     author_kind: Option<AuthorKind>,
     intent: Option<&str>,
 ) -> Result<Option<HistoryId>> {
+    let Some(h) = make_starting_history(settings, command, author, author_kind, intent) else {
+        return Ok(None);
+    };
+
+    // If the daemon can't take the command (e.g. it isn't running and couldn't be started), save it
+    // locally rather than dropping it; `history end` falls back to the local database to match.
     #[cfg(feature = "daemon")]
     if settings.daemon.enabled {
-        return handle_daemon_start(settings, command, author, author_kind, intent).await;
+        match handle_daemon_start(settings, h.clone()).await {
+            Ok(id) => return Ok(Some(id)),
+            Err(e) => {
+                userio::log::warn!("history-start-daemon-failed", error = format!("{e:#}"));
+            }
+        }
     }
 
     let db_path = &settings.db_path;
-    let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?).await?;
-    handle_start(&db, settings, command, author, author_kind, intent).await
+    let db = Sqlite::new(db_path, settings.local_timeout).await?;
+    handle_start(&db, &h).await;
+
+    Ok(Some(h.id))
 }
 
 #[instrument(level = "trace", skip_all, fields(id = %id, exit, duration = ?duration), err)]
 pub(super) async fn end_history_entry(
-    settings: &Settings,
+    settings: &Arc<Settings>,
     id: HistoryId,
     exit: i64,
     duration: Option<u64>,
 ) -> Result<()> {
+    // If the daemon can't end the command, it may have been saved locally by `history start` falling
+    // back when the daemon wasn't running, so finish it locally too.
     #[cfg(feature = "daemon")]
     if settings.daemon.enabled {
-        return handle_daemon_end(settings, id, exit, duration).await;
+        match handle_daemon_end(settings, id, exit, duration).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                userio::log::warn!("history-end-daemon-failed", error = format!("{e:#}"));
+            }
+        }
     }
 
     let db_path = &settings.db_path;
     let record_store_path = &settings.record_store_path;
 
-    let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?).await?;
-    let store =
-        SqliteStore::new(record_store_path, Duration::try_from_secs_f64(settings.local_timeout)?)
-            .await?;
+    let db = Sqlite::new(db_path, settings.local_timeout).await?;
+    let store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
 
     let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
         .context("could not load or generate encryption key")?;
-    let host_id = Settings::host_id().await?;
+    let host_id = settings.host_id().await?;
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
     handle_end(&db, store, history_store, settings, id, exit, duration).await
@@ -637,9 +608,50 @@ pub(super) async fn delete_history_entries(
         return Ok(());
     }
 
+    let entries: Vec<History> = entries.into_iter().collect();
+    #[cfg(feature = "octavo")]
+    let history_ids: Vec<HistoryId> = entries.iter().map(|h| h.id).collect();
+
     let ids = history_store.delete_entries(entries).await?;
     history_store.build_all(db, &ids).await?;
+
+    #[cfg(feature = "octavo")]
+    queue_octavo_deletions(settings, history_ids).await;
     Ok(())
+}
+
+/// Queues the deletion of `ids` from Octavo, for the daemon to send once it runs, if Octavo was
+/// ever on here.
+#[cfg(feature = "octavo")]
+async fn queue_octavo_deletions(settings: &Settings, ids: Vec<HistoryId>) {
+    let path = settings.octavo_queue_path();
+    if !path.exists() {
+        return;
+    }
+
+    let login = async { HubClient::new(settings)?.login(settings).await };
+    let login = match login.await {
+        Ok(login) => login,
+        Err(HubCallError::NotLoggedIn) => return,
+        Err(err) => {
+            userio::log::warn!(
+                "history-octavo-login-failed",
+                error = format!("{:#}", eyre::Report::new(err))
+            );
+            return;
+        }
+    };
+
+    // Octavo never stored an entry whose id isn't a UUIDv7.
+    let stored = ids.into_iter().filter(|&id| pb::UuidV7::try_from(id).is_ok());
+    let queued =
+        async { UploadQueue::open(path).await?.push_deletions(login.user_id(), stored).await };
+    if let Err(err) = queued.await {
+        userio::log::warn!(
+            "history-octavo-queue-failed",
+            error = format!("{:#}", eyre::Report::new(err))
+        );
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -931,10 +943,7 @@ impl Cmd {
 
         while let Some(reply) = stream.message().await? {
             if let Some(TailEventProto::Lagged(lagged)) = &reply.event {
-                eprintln!(
-                    "WARNING: atuin daemon dropped {} history events; tail fell behind",
-                    lagged.dropped
-                );
+                userio::log::warn!("history-tail-lagged", dropped = lagged.dropped);
                 continue;
             }
 
@@ -1010,14 +1019,11 @@ impl Cmd {
             .filter(|h| !h.should_save(settings))
             .collect();
 
-        match matches.len() {
-            0 => {
-                println!("No entries to prune.");
-                return Ok(());
-            }
-            1 => println!("Found 1 entry to prune."),
-            n => println!("Found {n} entries to prune."),
+        if matches.is_empty() {
+            userio::log::info!("history-prune-none");
+            return Ok(());
         }
+        userio::log::info!("history-prune-found", count = matches.len());
 
         if dry_run {
             print_list(
@@ -1031,11 +1037,11 @@ impl Cmd {
         } else {
             let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                 .context("could not load or generate encryption key")?;
-            let host_id = Settings::host_id().await?;
+            let host_id = settings.host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in &matches {
-                eprintln!("deleting {}", entry.id);
+                userio::log::info!("history-deleting", id = entry.id.to_string());
             }
 
             delete_history_entries(settings, &history_store, db, matches).await?;
@@ -1053,23 +1059,17 @@ impl Cmd {
         dry_run: bool,
     ) -> Result<()> {
         if dupkeep == 0 {
-            eprintln!(
-                "\"--dupkeep 0\" would keep 0 copies of duplicate commands and thus delete all of \
-                 them! Use \"atuin search --delete ...\" if you really want that."
-            );
+            userio::log::error!("history-dedup-keep-zero");
             std::process::exit(1);
         }
 
         let matches: Vec<History> = db.get_dups(before, dupkeep).await?;
 
-        match matches.len() {
-            0 => {
-                println!("No duplicates to delete.");
-                return Ok(());
-            }
-            1 => println!("Found 1 duplicate to delete."),
-            n => println!("Found {n} duplicates to delete."),
+        if matches.is_empty() {
+            userio::log::info!("history-dedup-none");
+            return Ok(());
         }
+        userio::log::info!("history-dedup-found", count = matches.len());
 
         if dry_run {
             print_list(
@@ -1083,11 +1083,11 @@ impl Cmd {
         } else {
             let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                 .context("could not load or generate encryption key")?;
-            let host_id = Settings::host_id().await?;
+            let host_id = settings.host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in &matches {
-                eprintln!("deleting {}", entry.id);
+                userio::log::info!("history-deleting", id = entry.id.to_string());
             }
 
             delete_history_entries(settings, &history_store, db, matches).await?;
@@ -1097,7 +1097,7 @@ impl Cmd {
 
     #[allow(clippy::too_many_lines)]
     #[instrument(level = "trace", skip_all, err)]
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub async fn run(self, settings: &Arc<Settings>) -> Result<()> {
         match self {
             Self::Start {
                 cmd_env,
@@ -1108,7 +1108,7 @@ impl Cmd {
                 ..
             } => {
                 let command = if cmd_env {
-                    std::env::var("ATUIN_COMMAND_LINE").unwrap_or_default()
+                    atuin_common::env::var("ATUIN_COMMAND_LINE").unwrap_or_default()
                 } else {
                     command.join(" ")
                 };
@@ -1140,23 +1140,18 @@ impl Cmd {
                 bail!("`atuin history tail` requires Atuin to be built with the `daemon` feature");
             }
             cmd => {
-                let context = current_context().await?;
+                let context = current_context(settings).await?;
 
                 let db_path = &settings.db_path;
                 let record_store_path = &settings.record_store_path;
 
-                let db = Sqlite::new(db_path, Duration::try_from_secs_f64(settings.local_timeout)?)
-                    .await?;
-                let store = SqliteStore::new(
-                    record_store_path,
-                    Duration::try_from_secs_f64(settings.local_timeout)?,
-                )
-                .await?;
+                let db = Sqlite::new(db_path, settings.local_timeout).await?;
+                let store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
 
                 let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                     .context("could not load or generate encryption key")?;
 
-                let host_id = Settings::host_id().await?;
+                let host_id = settings.host_id().await?;
                 let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
                 match cmd {
@@ -1203,7 +1198,7 @@ impl Cmd {
                         Ok(())
                     }
 
-                    Self::InitStore => history_store.init_store(&db).await,
+                    Self::InitStore => history_store.init_store(&db, settings).await,
 
                     Self::Prune { dry_run } => {
                         Self::handle_prune(&db, settings, store, context, dry_run).await
@@ -1217,8 +1212,8 @@ impl Cmd {
                         let before = i64::try_from(
                             interim::parse_date_string(
                                 before.as_str(),
-                                OffsetDateTime::now_utc(),
-                                interim::Dialect::Uk,
+                                OffsetDateTime::now_utc().to_offset(settings.timezone.0),
+                                settings.dialect.into(),
                             )?
                             .unix_timestamp_nanos(),
                         )?;
@@ -1231,17 +1226,15 @@ impl Cmd {
         }
     }
 
-    fn logs_enabled(&self) -> bool {
-        match self {
-            // Enable logs if not invoked from a shell hook. History commands invoked from shell
-            // hooks are performance-sensitive, so we want to skip any unnecessary initialization.
-            Self::Start { hook, .. } | Self::End { hook, .. } => !*hook,
-            _ => true,
-        }
+    /// Whether a shell hook ran the command.
+    pub const fn is_hook(&self) -> bool {
+        matches!(self, Self::Start { hook: true, .. } | Self::End { hook: true, .. })
     }
 
     pub fn log_config(&self) -> Option<LogConfig> {
-        self.logs_enabled().then(LogConfig::stderr_only)
+        // History commands invoked from shell hooks are performance-sensitive, so we want to skip
+        // any unnecessary initialization.
+        (!self.is_hook()).then(LogConfig::stderr_only)
     }
 }
 
@@ -1291,7 +1284,8 @@ mod tests {
             ..Settings::utc()
         };
 
-        handle_start(&db, &settings, "ls   \t", None, None, None).await.unwrap();
+        let h = make_starting_history(&settings, "ls   \t", None, None, None).unwrap();
+        handle_start(&db, &h).await;
 
         let history = db
             .before(OffsetDateTime::now_utc() + time::Duration::SECOND, 1)
@@ -1303,18 +1297,10 @@ mod tests {
     }
 
     #[rstest]
-    #[tokio::test]
-    async fn handle_start_drops_command_with_nul_byte(#[future] db: Sqlite, settings: Settings) {
-        let db = db.await;
-
+    fn make_starting_history_drops_command_with_nul_byte(settings: Settings) {
         // A command containing a NUL byte can never have been executed by a shell;
         // it should be dropped rather than committed to history.
-        let id = handle_start(&db, &settings, "hello\0world", None, None, None).await.unwrap();
-        assert!(id.is_none());
-
-        let stored =
-            db.before(OffsetDateTime::now_utc() + time::Duration::SECOND, 1).await.unwrap();
-        assert!(stored.is_empty());
+        assert!(make_starting_history(&settings, "hello\0world", None, None, None).is_none());
     }
 
     #[rstest]
@@ -1392,6 +1378,7 @@ mod tests {
         #[case] rows_left: i64,
     ) {
         use atuin_client::record::sqlite_store::SqliteStore;
+        use atuin_common::path::AbsPathBuf;
         use atuin_common::utils::uuid_v7;
         use atuin_domain::record::HostId;
 
@@ -1399,15 +1386,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = SqliteStore::in_memory(Duration::from_secs(2)).await.unwrap();
         let history_store = HistoryStore::new(store, HostId(uuid_v7()), paseto_v4::Key::generate());
-        let settings = Settings {
-            daemon: atuin_client::settings::Daemon {
-                enabled: daemon_enabled,
-                autostart: false,
-                socket_path: Some(tmp.path().join("no-daemon-here.sock")),
-                ..Default::default()
-            },
-            ..Settings::utc()
-        };
+        let mut settings = Settings::utc();
+        settings.daemon.enabled = daemon_enabled;
+        settings.daemon.autostart = false;
+        settings.daemon.socket_path = AbsPathBuf::new(tmp.path().join("no-daemon-here.sock")).ok();
         let entries: Vec<History> = ["echo one", "echo two"]
             .into_iter()
             .map(|cmd| {

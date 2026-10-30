@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use atuin_common::logs::{FileConfig, LogConfig};
 
 use crate::settings;
@@ -17,9 +15,9 @@ impl FromSettings for FileConfig {
             return None;
         }
         Some(Self {
-            path: PathBuf::from_iter([&settings.dir, &child.file]),
+            path: settings.dir.join(&child.file),
             level: child.level.unwrap_or(settings.level),
-            retention_days: child.retention.unwrap_or(settings.retention),
+            retention: child.retention.unwrap_or(settings.retention),
         })
     }
 }

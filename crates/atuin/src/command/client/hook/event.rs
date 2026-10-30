@@ -4,10 +4,13 @@
 //! an event we care about. If we don't know how to deserialize it/don't care for it, we need to
 //! drop that on the floor. The [`HookEvent`] type represents agent events we know/care about.
 
+use std::path::PathBuf;
+
 use atuin_common::string::NonNulStr;
 use serde_json::error::Category;
 
 use super::wire::{HookEventName, WireHookEvent, WireToolName};
+use crate::i18n::fl;
 
 /// Why a hook payload could not be parsed.
 ///
@@ -19,7 +22,7 @@ pub enum ParseError {
     /// The payload on stdin was not valid JSON — a syntax error or truncated
     /// input. Agents always emit syntactically valid JSON, so this signals a
     /// real fault rather than an event to skip.
-    #[error("hook payload is not valid JSON at line {line}, column {column}")]
+    #[error("{}", fl!("hook-malformed-json", line = *.line, column = *.column))]
     MalformedJson {
         line: usize,
         column: usize,
@@ -40,7 +43,10 @@ pub enum HookEvent {
     /// A Bash command finished; close the matching history entry.
     End {
         tool_use_id: String,
-        exit: i64,
+        /// Its exit code, when the event says it.
+        exit: Option<i64>,
+        /// The session's transcript, where Codex records the exit code its event doesn't say.
+        transcript: Option<PathBuf>,
     },
 }
 
@@ -50,26 +56,29 @@ impl From<WireHookEvent> for Option<HookEvent> {
     ///
     /// We **don't** care about:
     ///   - Non-`Bash` tool invocations.
-    ///   - Tool invocations which are missing a `tool_use_id`.
+    ///   - Tool invocations which are missing a `tool_use_id`, unless the session and the
+    ///     command can stand in for it ([`correlation_key`]).
+    ///   - Commands started in the background (Copilot's `mode: async`): their end says only
+    ///     that they started, so recording one would give it the wrong exit and duration.
     fn from(wire: WireHookEvent) -> Self {
         if matches!(wire.tool_name, WireToolName::Other) {
             return None;
         }
 
+        let (command, intent) = match wire.tool_input {
+            Some(input) if input.is_background() => return None,
+            Some(input) => (input.command, input.description),
+            None => (None, None),
+        };
         // Present but empty is as good as missing: a start could never be
         // matched to its end.
-        if wire.tool_use_id.is_empty() {
-            return None;
-        }
-        let tool_use_id = wire.tool_use_id;
+        let tool_use_id = match wire.tool_use_id.filter(|id| !id.is_empty()) {
+            Some(id) => id,
+            None => correlation_key(wire.session_id.as_deref()?, command.as_deref()?),
+        };
 
         match wire.hook_event_name {
             HookEventName::PreToolUse => {
-                let (command, intent) = match wire.tool_input {
-                    Some(input) => (input.command, input.description),
-                    None => (None, None),
-                };
-
                 // A missing or empty command has nothing to record.
                 let command = command.filter(|command| !command.is_empty())?;
 
@@ -79,17 +88,35 @@ impl From<WireHookEvent> for Option<HookEvent> {
                     tool_use_id,
                 })
             }
-            HookEventName::PostToolUse => {
-                let exit = wire.tool_response.and_then(|response| response.exit_code).unwrap_or(0);
-                Some(HookEvent::End { tool_use_id, exit })
-            }
+            HookEventName::PostToolUse => Some(HookEvent::End {
+                tool_use_id,
+                exit: wire
+                    .tool_response
+                    .and_then(|response| response.exit_code())
+                    .or_else(|| wire.tool_result.and_then(|result| result.exit_code())),
+                transcript: wire.transcript_path,
+            }),
+            // Failed: with the exit code its error starts with (`Exit code 2`), else 1.
             HookEventName::PostToolUseFailure => Some(HookEvent::End {
                 tool_use_id,
-                exit: 1,
+                exit: Some(wire.error.as_deref().and_then(failure_exit_code).unwrap_or(1)),
+                transcript: wire.transcript_path,
             }),
             HookEventName::Other => None,
         }
     }
+}
+
+/// The exit code a Claude Code failure's `error` starts with (`Exit code <n>`), if it does.
+/// What stands in for a `tool_use_id` an agent (Copilot) doesn't send: the session and the
+/// command, which both the start and the end of a call carry. Two identical commands running at
+/// once in one session share a key, and the second to end closes the first's entry.
+fn correlation_key(session_id: &str, command: &str) -> String {
+    format!("{session_id}-{:016x}", xxhash_rust::xxh3::xxh3_64(command.as_bytes()))
+}
+
+fn failure_exit_code(error: &str) -> Option<i64> {
+    error.lines().next()?.strip_prefix("Exit code ")?.trim().parse().ok()
 }
 
 impl HookEvent {
@@ -126,6 +153,20 @@ mod tests {
         NonNulStr::new(s.to_owned()).unwrap()
     }
 
+    /// The key the Copilot cases below correlate by.
+    fn copilot_key(command: &str) -> String {
+        correlation_key("25e51fe0-710a-4dfe-973e-caf8e2629ad7", command)
+    }
+
+    #[rstest]
+    fn the_correlation_key_is_the_session_and_the_commands_hash() {
+        let key = copilot_key("echo probe-hello; false");
+        assert!(key.starts_with("25e51fe0-710a-4dfe-973e-caf8e2629ad7-"), "{key}");
+        assert_eq!(key.len(), 36 + 1 + 16, "{key}");
+        assert_ne!(copilot_key("a"), copilot_key("b"));
+        assert_ne!(correlation_key("s", "a"), correlation_key("t", "a"));
+    }
+
     #[rstest]
     #[case::pre_tool_use_with_intent(
         json!({
@@ -159,28 +200,28 @@ mod tests {
             "tool_response": {"exitCode": 3, "stdout": "hello\n"},
             "tool_use_id": "toolu_abc123"
         }),
-        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: 3 })
+        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: Some(3), transcript: None })
     )]
-    #[case::post_tool_use_without_exit_code_defaults_zero(
+    #[case::post_tool_use_without_exit_code_says_none(
         json!({
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
             "tool_response": {},
             "tool_use_id": "toolu_abc123"
         }),
-        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: 0 })
+        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: None, transcript: None })
     )]
-    // A null exitCode also defaults to 0.
-    #[case::null_exit_code_defaults_zero(
+    // Nor does a null exitCode.
+    #[case::null_exit_code_says_none(
         json!({
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
             "tool_response": {"exitCode": null},
             "tool_use_id": "toolu_abc123"
         }),
-        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: 0 })
+        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: None, transcript: None })
     )]
-    // PostToolUseFailure forces exit 1 and ignores tool_response entirely.
+    // PostToolUseFailure without an exit code in its error is exit 1, whatever tool_response says.
     #[case::failure_forces_exit_one_ignoring_response(
         json!({
             "hook_event_name": "PostToolUseFailure",
@@ -189,7 +230,41 @@ mod tests {
             "tool_response": {"exitCode": 0},
             "tool_use_id": "toolu_abc123"
         }),
-        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: 1 })
+        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: Some(1), transcript: None })
+    )]
+    // Claude Code's failure says a shell command's exit code first in its error (Claude Code
+    // 2.1.291, `PostToolUseFailure`'s `error`).
+    #[case::failure_with_its_exit_code(
+        json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls /nope"},
+            "tool_use_id": "toolu_abc123",
+            "error": "Exit code 2\nls: cannot access '/nope': No such file or directory",
+            "is_interrupt": false
+        }),
+        Some(HookEvent::End { tool_use_id: "toolu_abc123".into(), exit: Some(2), transcript: None })
+    )]
+    // Codex 0.160 says only the output, and where its transcript is (a real payload's fields).
+    #[case::codex_post_tool_use(
+        json!({
+            "session_id": "01a11e4d-75d7-70f2-8c71-7f1cc87cbe85",
+            "turn_id": "01a11e4d-761f-7073-955e-e96a0a319fc3",
+            "transcript_path": "/w/.codex/sessions/2026/10/09/rollout-x.jsonl",
+            "cwd": "/w",
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-6-luna",
+            "permission_mode": "bypassPermissions",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls /nonexistent_juliettea"},
+            "tool_response": "ls: cannot access '/nonexistent_juliettea': No such file or directory\n",
+            "tool_use_id": "exec-55bd0a92-7032-4356-b380-ac1cc1ea66f4"
+        }),
+        Some(HookEvent::End {
+            tool_use_id: "exec-55bd0a92-7032-4356-b380-ac1cc1ea66f4".into(),
+            exit: None,
+            transcript: Some("/w/.codex/sessions/2026/10/09/rollout-x.jsonl".into()),
+        })
     )]
     // Non-Bash tools are never recorded.
     #[case::non_bash_tool_skipped(
@@ -201,7 +276,7 @@ mod tests {
         }),
         None
     )]
-    // A missing tool_use_id can't be correlated start↔end → skip.
+    // A missing tool_use_id can't be correlated start↔end without a session → skip.
     #[case::missing_tool_use_id_skipped(
         json!({
             "hook_event_name": "PreToolUse",
@@ -209,6 +284,67 @@ mod tests {
             "tool_input": {"command": "echo hi"}
         }),
         None
+    )]
+    // Copilot CLI 1.0.104 sends no tool_use_id: the session and the command correlate the
+    // start with the end, which carries the command again and the exit code in the output.
+    #[case::copilot_pre_tool_use(
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "25e51fe0-710a-4dfe-973e-caf8e2629ad7",
+            "timestamp": "2026-10-27T18:25:31.292Z",
+            "cwd": "/tmp/copilot-play",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo probe-hello; false", "description": "Run probe echo command"}
+        }),
+        Some(HookEvent::Start {
+            command: non_nul("echo probe-hello; false"),
+            intent: Some("Run probe echo command".into()),
+            tool_use_id: copilot_key("echo probe-hello; false"),
+        })
+    )]
+    #[case::copilot_post_tool_use(
+        json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "25e51fe0-710a-4dfe-973e-caf8e2629ad7",
+            "timestamp": "2026-10-27T18:25:31.430Z",
+            "cwd": "/tmp/copilot-play",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo probe-hello; false", "description": "Run probe echo command"},
+            "tool_result": {"result_type": "success", "text_result_for_llm": "probe-hello\n<shellId: 0 completed with exit code 1>"}
+        }),
+        Some(HookEvent::End { tool_use_id: copilot_key("echo probe-hello; false"), exit: Some(1), transcript: None })
+    )]
+    // A command Copilot started in the background (`mode: async`) is never recorded: its end
+    // comes when it starts. A real payload, Copilot CLI 1.0.104.
+    #[case::copilot_background_start_skipped(
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "25e51fe0-710a-4dfe-973e-caf8e2629ad7",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 30; echo late", "description": "Background sleep then echo", "mode": "async"}
+        }),
+        None
+    )]
+    #[case::copilot_background_end_skipped(
+        json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "25e51fe0-710a-4dfe-973e-caf8e2629ad7",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 30; echo late", "description": "Background sleep then echo", "mode": "async"},
+            "tool_result": {"result_type": "success", "text_result_for_llm": "<command started in background with shellId: 1>"}
+        }),
+        None
+    )]
+    // A failing command is a `PostToolUse` too, its exit code in the trailer alone.
+    #[case::copilot_failed_command(
+        json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "25e51fe0-710a-4dfe-973e-caf8e2629ad7",
+            "tool_name": "Bash",
+            "tool_input": {"command": "exit 3", "description": "Run exit 3"},
+            "tool_result": {"result_type": "success", "text_result_for_llm": "\n<shellId: 0 completed with exit code 3>"}
+        }),
+        Some(HookEvent::End { tool_use_id: copilot_key("exit 3"), exit: Some(3), transcript: None })
     )]
     // An empty tool_use_id is treated the same as missing.
     #[case::empty_tool_use_id_skipped(
@@ -293,6 +429,22 @@ mod tests {
         assert_eq!(HookEvent::from_json_str(&input.to_string()).unwrap(), expected);
     }
 
+    /// Codex serializes `tool_response` as a bare string, unlike the object
+    /// Claude Code sends. Dropping the completion leaves the history entry
+    /// opened by the matching `PreToolUse` unfinished, so nothing is recorded
+    /// when the daemon owns the store (issue #4169).
+    #[rstest]
+    #[case::string_tool_response(
+        r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"example-call","session_id":"example-session","cwd":"/tmp","tool_input":{"command":"printf probe"},"tool_response":"probe"}"#,
+        Some(HookEvent::End { tool_use_id: "example-call".into(), exit: None, transcript: None })
+    )]
+    fn completion_accepts_string_tool_response(
+        #[case] input: &str,
+        #[case] expected: Option<HookEvent>,
+    ) {
+        assert_eq!(HookEvent::from_json_str(input).unwrap(), expected);
+    }
+
     /// Well-formed JSON that isn't a hook event we model is skipped, not an
     /// error — it decodes cleanly as JSON but doesn't fit the schema.
     #[rstest]
@@ -311,10 +463,14 @@ mod tests {
     #[case::not_json("not json")]
     #[case::truncated(r#"{"tool_name":"#)]
     fn malformed_json_is_an_error(#[case] input: &str) {
-        let ParseError::MalformedJson { line, column, .. } =
-            HookEvent::from_json_str(input).unwrap_err();
+        let err = HookEvent::from_json_str(input).unwrap_err();
+        let ParseError::MalformedJson { line, column, .. } = err;
 
         assert!(line >= 1 && column >= 1, "position should be 1-based, got {line}:{column}");
+        assert_eq!(
+            err.to_string(),
+            format!("hook payload is not valid JSON at line {line}, column {column}")
+        );
     }
 
     proptest! {
@@ -364,14 +520,14 @@ mod tests {
 
             prop_assert_eq!(
                 HookEvent::from_json_str(&input.to_string()).unwrap(),
-                Some(HookEvent::End { tool_use_id, exit })
+                Some(HookEvent::End { tool_use_id, exit: Some(exit), transcript: None })
             );
         }
 
-        /// `PostToolUseFailure` always records exit 1, whatever the response
-        /// claims.
+        /// `PostToolUseFailure` records exit 1, whatever the response claims,
+        /// unless its error says the exit code.
         #[test]
-        fn failure_event_always_exits_one(
+        fn failure_without_an_exit_code_in_its_error_exits_one(
             reported_exit in any::<i64>(),
             tool_use_id in r"[^\p{Cc}]+",
         ) {
@@ -384,7 +540,7 @@ mod tests {
 
             prop_assert_eq!(
                 HookEvent::from_json_str(&input.to_string()).unwrap(),
-                Some(HookEvent::End { tool_use_id, exit: 1 })
+                Some(HookEvent::End { tool_use_id, exit: Some(1), transcript: None })
             );
         }
 

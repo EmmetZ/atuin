@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 
 use atuin_client::settings::Tmux;
-use atuin_dotfiles::store::AliasStore;
-use atuin_dotfiles::store::var::VarStore;
-use eyre::Result;
+use atuin_common::env;
 
 use super::StaticInitOptions;
 use crate::shell::BASH;
@@ -18,15 +16,19 @@ fn write_tmux_config<W: Write>(writer: &mut W, tmux: &Tmux) -> io::Result<()> {
 }
 
 fn write_static_init<W: Write>(writer: &mut W, options: &StaticInitOptions<'_>) -> io::Result<()> {
-    let (bind_ctrl_r, bind_up_arrow) = if std::env::var("ATUIN_NOBIND").is_ok() {
-        (false, false)
+    let (bind_ctrl_r, bind_up_arrow, bind_ai_resume) = if env::var("ATUIN_NOBIND").is_ok() {
+        (false, false, false)
     } else {
-        (options.enable_ctrl_r, options.enable_up_arrow)
+        (
+            options.enable_ctrl_r,
+            options.enable_up_arrow,
+            cfg!(feature = "ai") && options.enable_ai_resume,
+        )
     };
 
     writeln!(writer, "{} && {{", BASH.include_guard)?;
 
-    if std::env::var_os("ATUIN_NO_BUILTIN_PREEXEC").is_none_or(|s| s.is_empty()) {
+    if env::var_os("ATUIN_NO_BUILTIN_PREEXEC").is_none_or(|s| s.is_empty()) {
         writeln!(writer, "# Set ATUIN_NO_BUILTIN_PREEXEC=1 to disable loading bash-preexec")?;
         writeln!(writer, "__atuin_load_builtin_preexec() {{")?;
         for line in BASH.preexec.lines() {
@@ -38,6 +40,7 @@ fn write_static_init<W: Write>(writer: &mut W, options: &StaticInitOptions<'_>) 
     write_tmux_config(writer, options.tmux)?;
     writeln!(writer, "__atuin_bind_ctrl_r={bind_ctrl_r}")?;
     writeln!(writer, "__atuin_bind_up_arrow={bind_up_arrow}")?;
+    writeln!(writer, "__atuin_bind_ai_resume={bind_ai_resume}")?;
     writeln!(writer, "{}", BASH.main)?;
 
     #[cfg(feature = "ai")]
@@ -55,20 +58,4 @@ pub fn init_static(options: &StaticInitOptions<'_>) {
         // than panicking, so we manually panic here to keep the same behavior.
         panic!("failed printing to stdout: {e}");
     }
-}
-
-pub async fn init(
-    aliases: AliasStore,
-    vars: VarStore,
-    options: &StaticInitOptions<'_>,
-) -> Result<()> {
-    init_static(options);
-
-    let aliases = atuin_dotfiles::shell::bash::alias_config(&aliases).await;
-    let vars = atuin_dotfiles::shell::bash::var_config(&vars).await;
-
-    println!("{aliases}");
-    println!("{vars}");
-
-    Ok(())
 }
