@@ -1,0 +1,88 @@
+name: Fork Linux Release
+
+# 每次推送到 dev 时自动编译 Linux x86_64 release 版 atuin，
+# 上传为 Actions Artifact，并更新滚动预发布 dev-latest。
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: atuin
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: build atuin (linux x86_64, release)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          shared-key: fork-release-linux
+          cache-on-failure: true
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked -p atuin
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          out="atuin-${short}-${TARGET}"
+          mkdir -p "$out"
+          cp "target/release/${BIN}" "$out/${BIN}"
+          strip "$out/${BIN}" || true
+          cp LICENSE "$out/"
+          [ -f README.md ] && cp README.md "$out/" || true
+          tar -C "$out" -czf "${out}.tar.gz" .
+          sha256sum "${out}.tar.gz" > "${out}.tar.gz.sha256"
+          echo "ARCHIVE=${out}.tar.gz" >> "$GITHUB_ENV"
+          echo "### Built \`${out}.tar.gz\`" >> "$GITHUB_STEP_SUMMARY"
+          cat "${out}.tar.gz.sha256" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: atuin-linux-x86_64-${{ github.sha }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          retention-days: 30
+
+      - name: Publish rolling prerelease (dev-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="Automated build of \`${GITHUB_SHA:0:7}\` on $(date -u +'%Y-%m-%d %H:%M UTC')"
+          if gh release view dev-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit dev-latest --repo "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create dev-latest --repo "$GITHUB_REPOSITORY" \
+              --prerelease --title "dev-latest" --notes "$notes" --target "$GITHUB_SHA"
+          fi
+          gh release upload dev-latest "$ARCHIVE" "$ARCHIVE.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
