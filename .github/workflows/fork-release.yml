@@ -18,6 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   BIN: atuin
   TARGET: x86_64-unknown-linux-gnu
+  PROFILE: dist
 
 jobs:
   build:
@@ -45,7 +46,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
       - name: Build release binary
-        run: cargo build --release --locked -p atuin
+        run: cargo build --profile "$PROFILE" --locked -p atuin
 
       - name: Package
         run: |
@@ -53,7 +54,7 @@ jobs:
           short="${GITHUB_SHA:0:7}"
           out="atuin-${short}-${TARGET}"
           mkdir -p "$out"
-          cp "target/release/${BIN}" "$out/${BIN}"
+          cp "target/${PROFILE}/${BIN}" "$out/${BIN}"
           strip "$out/${BIN}" || true
           cp LICENSE "$out/"
           [ -f README.md ] && cp README.md "$out/" || true
